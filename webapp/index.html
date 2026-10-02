@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>AI Helper</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/style.css?v=1">
+</head>
+<body>
+  <main id="view" class="view"></main>
+
+  <nav class="tabbar" id="tabbar">
+    <button data-tab="home" class="active"><span class="tab-ico">🏠</span>Главная</button>
+    <button data-tab="history"><span class="tab-ico">🕘</span>История</button>
+    <button data-tab="settings"><span class="tab-ico">⚙️</span>Настройки</button>
+  </nav>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js?v=1"></script>
+</body>
+</html>

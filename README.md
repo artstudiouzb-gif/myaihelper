@@ -1,0 +1,155 @@
+# myaihelper — личный AI-помощник для видео-контента
+
+Telegram-бот с Mini App: 13 инструментов для создания AI-видео на ваших собственных ключах
+**Claude, ChatGPT, Gemini и ElevenLabs**. Без подписок и баланса — платите только провайдерам по факту.
+
+| Раздел | Что делает | Через что работает |
+|---|---|---|
+| 💡 Генератор идей | Вирусные идеи по теме | Claude / ChatGPT / Gemini (на выбор) |
+| 🪝 Вирусные хуки | Хуки на первые 3 секунды | на выбор |
+| 🔁 Разбор видео | Транскрипт, перевод, раскадровка, замена персонажа | Gemini (понимает видео) |
+| 📱 Stories и Reels | Контент-план, мини-сериалы в Stories | на выбор |
+| ⚡ Seedance промпт | Режиссёрский промпт по шотам | на выбор |
+| 🎬 Мини-драма | Вертикальный сериал из 5 серий | на выбор |
+| 🎞️ Создание сериала | Связанные 10-секундные промпты с continuity | на выбор |
+| 👑 Промпты для Grok | Кинематографичные кадры | на выбор |
+| 🎨 GPT Image | Картинка из текста или по референсам | OpenAI GPT Image или Gemini Nano Banana |
+| ✨ Видео-анимация | Моушн-дизайн под каждую фразу + субтитры SRT | Gemini (расшифровка) + на выбор |
+| 🎥 Ракурсы камеры | Новые ракурсы из одного кадра (промпты + картинки) | на выбор + Gemini/OpenAI для картинок |
+| 🎙️ Голоса | Озвучка текста, клон голоса, замена голоса в аудио/видео | ElevenLabs |
+| 🎭 Карточка персонажа | Описание + character sheet по 3 фото | на выбор + Gemini/OpenAI |
+
+Картинки, аудио и видео бот присылает и в чат. История результатов хранится на устройстве (вкладка «История»).
+
+---
+
+## 1. Что понадобится
+
+| Что | Где взять |
+|---|---|
+| Токен бота | [@BotFather](https://t.me/BotFather) → `/newbot` |
+| Ваш Telegram ID | [@userinfobot](https://t.me/userinfobot) |
+| Claude | https://console.anthropic.com/settings/keys |
+| ChatGPT / GPT Image | https://platform.openai.com/api-keys |
+| Gemini | https://aistudio.google.com/apikey |
+| ElevenLabs | https://elevenlabs.io/app/settings/api-keys |
+
+Не обязательно подключать всё сразу: раздел без ключа просто станет неактивным.
+Но **Gemini** очень желателен — только он умеет смотреть видео.
+
+> Никому не отправляйте ключи и не коммитьте файл `.env` в GitHub.
+
+---
+
+## 2. Деплой на Railway (рекомендуется, проще всего)
+
+1. Зарегистрируйтесь на https://railway.com через GitHub.
+2. **New Project → Deploy from GitHub repo →** выберите `myaihelper`.
+3. Откройте сервис → вкладка **Variables** → добавьте переменные:
+   ```
+   BOT_TOKEN=...
+   ALLOWED_USER_IDS=ваш_ID
+   ANTHROPIC_API_KEY=...
+   OPENAI_API_KEY=...
+   GEMINI_API_KEY=...
+   ELEVENLABS_API_KEY=...
+   ```
+4. Вкладка **Settings → Networking → Generate Domain**. Railway выдаст адрес вида
+   `myaihelper-production.up.railway.app` — бот подхватит его сам (`WEBAPP_URL` указывать не нужно).
+5. Дождитесь окончания деплоя (вкладка **Deployments**, статус *Active*).
+6. Напишите боту `/start` → нажмите **🚀 Открыть**.
+
+Обновление: любой `git push` в ветку, подключённую в Railway, пересобирает бота автоматически.
+
+## 3. Деплой на Render
+
+1. https://render.com → **New → Blueprint** → выберите репозиторий (используется `render.yaml`).
+2. Заполните переменные (как в шаге 3 для Railway).
+3. После деплоя напишите боту `/start`.
+
+> Бесплатный тариф Render «засыпает» через 15 минут без запросов — вместе с ним засыпает и бот.
+> Для постоянной работы нужен тариф Starter (указан в `render.yaml`).
+
+## 4. Деплой на свой VPS (Docker + автоматический HTTPS)
+
+Нужен VPS (Ubuntu 22.04+) и домен (или бесплатный поддомен, например на https://www.duckdns.org),
+у которого A-запись указывает на IP сервера.
+
+```bash
+# 1. Установить Docker
+curl -fsSL https://get.docker.com | sh
+
+# 2. Скачать проект
+git clone https://github.com/artstudiouzb-gif/myaihelper.git
+cd myaihelper
+
+# 3. Настроить
+cp .env.example .env
+nano .env        # заполнить ключи, DOMAIN=bot.example.com, WEBAPP_URL=https://bot.example.com
+
+# 4. Запустить
+docker compose up -d --build
+
+# Логи / обновление
+docker compose logs -f bot
+git pull && docker compose up -d --build
+```
+
+Caddy сам получит HTTPS-сертификат для домена.
+
+## 5. Локальная проверка интерфейса (без Telegram)
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # заполнить хотя бы BOT_TOKEN и ALLOWED_USER_IDS
+DEV_SKIP_AUTH=1 python -m bot.main
+# открыть http://localhost:8080
+```
+
+`DEV_SKIP_AUTH=1` отключает проверку Telegram — **никогда не включайте это на сервере**.
+Чтобы открыть Mini App из Telegram с компьютера, нужен HTTPS-туннель, например
+`cloudflared tunnel --url http://localhost:8080` (полученный адрес укажите в `WEBAPP_URL`).
+
+---
+
+## Безопасность
+
+- Mini App проверяет цифровую подпись Telegram (`initData`) — подделать запрос с чужого устройства нельзя.
+- Пользоваться ботом могут только ID из `ALLOWED_USER_IDS`. Остальным бот ответит, что он личный,
+  и покажет их ID (удобно, чтобы узнать свой).
+- Ключи хранятся только в переменных окружения сервера и никогда не попадают в браузер.
+
+## Модели
+
+Модели меняются переменными без правки кода (значения по умолчанию — в `.env.example`):
+`CLAUDE_MODEL`, `OPENAI_MODEL`, `OPENAI_IMAGE_MODEL`, `GEMINI_MODEL`, `GEMINI_IMAGE_MODEL`,
+`ELEVENLABS_TTS_MODEL`, `ELEVENLABS_STS_MODEL`.
+
+## Частые проблемы
+
+| Проблема | Решение |
+|---|---|
+| Бот пишет «Это личный бот» | Добавьте свой ID в `ALLOWED_USER_IDS` и перезапустите |
+| «Не задан WEBAPP_URL» | Railway: сгенерируйте домен (Settings → Networking). VPS: укажите `WEBAPP_URL=https://…` |
+| «Откройте приложение через Telegram-бота» | Страница открыта в обычном браузере — откройте через кнопку в боте |
+| Ошибка про баланс / `insufficient_quota` / 401 | Проверьте ключ и пополните баланс у провайдера |
+| GPT Image: ошибка про verification | Подтвердите организацию: https://platform.openai.com/settings/organization/general |
+| Клонирование голоса не работает | Нужен платный тариф ElevenLabs (Starter и выше) |
+| Модель «не найдена» | Укажите актуальное имя модели в переменных `*_MODEL` |
+
+## Структура
+
+```
+bot/
+  main.py       — запуск бота (polling) и веб-сервера
+  config.py     — настройки из переменных окружения
+  auth.py       — проверка подписи Telegram и белого списка
+  tools.py      — все 13 разделов: поля форм, промпты, логика
+  web.py        — API для Mini App
+  ai/llm.py     — Claude / ChatGPT / Gemini (текст, фото, видео)
+  ai/images.py  — генерация картинок (OpenAI, Gemini)
+  ai/voice.py   — ElevenLabs + ffmpeg
+webapp/         — интерфейс Mini App (HTML/CSS/JS без сборки)
+```
+
+Новый раздел добавляется одной записью в `TOOLS` в `bot/tools.py` — интерфейс построится сам.
