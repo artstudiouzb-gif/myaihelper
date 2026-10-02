@@ -1,23 +1,28 @@
 <!doctype html>
-<html lang="ru">
+<html lang="ru" data-theme="indigo">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <meta name="color-scheme" content="dark">
-  <title>AI Helper</title>
+  <title>AI Studio</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <link rel="stylesheet" href="/static/style.css?v=1">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
   <main id="view" class="view"></main>
+  <div id="cta"></div>
 
   <nav class="tabbar" id="tabbar">
-    <button data-tab="home" class="active"><span class="tab-ico">🏠</span>Главная</button>
-    <button data-tab="history"><span class="tab-ico">🕘</span>История</button>
-    <button data-tab="settings"><span class="tab-ico">⚙️</span>Настройки</button>
+    <div class="inner">
+      <button data-tab="home" class="active"><span class="pill" data-icon="home"></span>Главная</button>
+      <button data-tab="history"><span class="pill" data-icon="clock"></span>История</button>
+      <button data-tab="settings"><span class="pill" data-icon="sliders"></span>Настройки</button>
+    </div>
   </nav>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/app.js?v=1"></script>
+  <script src="/static/app.js?v=2"></script>
 </body>
 </html>

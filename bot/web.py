@@ -57,7 +57,7 @@ async def index(_: web.Request) -> web.Response:
 
 async def api_config(request: web.Request) -> web.Response:
     return web.json_response({
-        "user": {"first_name": request["user"].get("first_name", "")},
+        "user": {k: request["user"].get(k, "") for k in ("first_name", "last_name", "photo_url")},
         "providers": config.available_providers(),
         "models": {
             "claude": config.CLAUDE_MODEL, "openai": config.OPENAI_MODEL, "gemini": config.GEMINI_MODEL,

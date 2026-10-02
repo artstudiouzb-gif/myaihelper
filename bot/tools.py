@@ -44,8 +44,8 @@ class Tool:
     id: str
     title: str
     subtitle: str
-    icon: str
-    colors: tuple[str, str]
+    icon: str  # имя SVG-иконки из webapp/app.js
+    category: str  # scripts | prompts | visual | media
     fields: list[dict]
     system: str = ""
     task: str = ""
@@ -57,7 +57,7 @@ class Tool:
     def public(self) -> dict:
         return {
             "id": self.id, "title": self.title, "subtitle": self.subtitle, "icon": self.icon,
-            "colors": self.colors, "fields": self.fields, "uses_llm": self.uses_llm,
+            "category": self.category, "fields": self.fields, "uses_llm": self.uses_llm,
             "needs": self.needs, "hint": self.hint,
         }
 
@@ -92,7 +92,7 @@ def check(name, label, default=False, **kw):
     return {"name": name, "label": label, "type": "checkbox", "default": default, **kw}
 
 
-ASPECTS = [("9:16", "9:16 вертикально"), ("16:9", "16:9 горизонтально"), ("1:1", "1:1 квадрат")]
+ASPECTS = [("9:16", "9:16"), ("16:9", "16:9"), ("1:1", "1:1")]
 OUT_LANGS = [("русский", "Русский"), ("узбекский", "Узбекский"), ("английский", "Английский"),
              ("казахский", "Казахский"), ("турецкий", "Турецкий")]
 
@@ -394,7 +394,7 @@ async def run_character(tool: Tool, ctx: RunContext) -> Result:
 
 TOOLS: list[Tool] = [
     Tool(
-        "ideas", "Генератор идей", "Вирусные идеи по теме", "💡", ("#ffb020", "#ff6a00"),
+        "ideas", "Генератор идей", "Вирусные идеи по теме", "bulb", "scripts",
         [
             area("topic", "Тема или ниша", "Например: кофейня в Ташкенте, фитнес для мам, AI-новости", True),
             text("audience", "Целевая аудитория", "Кто будет смотреть (необязательно)"),
@@ -412,7 +412,7 @@ TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        "hooks", "Вирусные хуки", "Удержание в первые 3 секунды", "🪝", ("#ff6a3d", "#ff2d2d"),
+        "hooks", "Вирусные хуки", "Удержание в первые 3 секунды", "magnet", "scripts",
         [
             area("topic", "О чём видео", "Кратко опишите видео или вставьте сценарий", True),
             select("style", "Тип хуков", ["Смешанные", "Интрига", "Шок / провокация", "Вопрос",
@@ -427,7 +427,7 @@ TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        "video_study", "Разбор видео", "Перевод и замена персонажа", "🔁", ("#ff7a2f", "#ff3b1f"),
+        "video_study", "Разбор видео", "Перевод и замена персонажа", "scan", "media",
         [
             files("video", "Видео", "video/*", required=True),
             select("mode", "Что сделать", [("full", "Полный разбор + промпты"), ("translate", "Перевод речи"),
@@ -440,7 +440,7 @@ TOOLS: list[Tool] = [
         hint="Видео анализирует Gemini. Лучше загружать ролики до 2–3 минут.",
     ),
     Tool(
-        "stories", "Stories и Reels", "Мини-серии и контент-план", "📱", ("#ff4d6d", "#e01e37"),
+        "stories", "Stories и Reels", "Мини-серии и контент-план", "phone", "scripts",
         [
             area("niche", "Ниша и о чём блог", "Например: стоматология, личный бренд дизайнера", True),
             select("goal", "Что нужно", ["Контент-план для Reels", "Мини-сериал в Stories",
@@ -457,7 +457,7 @@ TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        "seedance", "Seedance промпт", "Профессиональный режиссёрский промпт", "⚡", ("#ff5a1f", "#d8290f"),
+        "seedance", "Seedance промпт", "Профессиональный режиссёрский промпт", "zap", "prompts",
         [
             area("idea", "Идея сцены", "Что должно происходить в видео", True),
             select("duration", "Длительность", ["5 секунд", "10 секунд", "15 секунд"], "10 секунд"),
@@ -475,7 +475,7 @@ TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        "minidrama", "Мини-драма", "Вертикальный сериал из 5 серий", "🎬", ("#ff5e7e", "#c9184a"),
+        "minidrama", "Мини-драма", "Вертикальный сериал из 5 серий", "clapper", "scripts",
         [
             area("premise", "Завязка", "О чём сериал, кто герои", True),
             select("genre", "Жанр", ["Романтика", "Семейная драма", "Месть", "Триллер", "Комедия",
@@ -493,7 +493,7 @@ TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        "serial", "Создание сериала", "Связанные 10-секундные промпты", "🎞️", ("#f06595", "#7048e8"),
+        "serial", "Создание сериала", "Связанные 10-секундные промпты", "layers", "prompts",
         [
             area("story", "История", "Перескажите сюжет целиком", True),
             number("scenes", "Количество сцен", 6, 2, 20),
@@ -511,7 +511,7 @@ TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        "grok", "Промпты для Grok", "Кадры, как в кино", "👑", ("#8d99ae", "#4a5568"),
+        "grok", "Промпты для Grok", "Кадры, как в кино", "aperture", "prompts",
         [
             area("idea", "Идея", "Что должно быть в кадрах", True),
             select("genre", "Жанр", ["Драма", "Боевик", "Нуар", "Фантастика", "Хоррор", "Романтика",
@@ -527,7 +527,7 @@ TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        "image", "GPT Image", "Картинка из текста или по референсу", "🎨", ("#20c997", "#0ca678"),
+        "image", "GPT Image", "Картинка из текста или по референсу", "image", "visual",
         [
             area("prompt", "Что нарисовать", "Опишите изображение", True),
             files("refs", "Референсы", "image/*", multiple=True, max_files=4),
@@ -540,7 +540,7 @@ TOOLS: list[Tool] = [
         run=run_image,
     ),
     Tool(
-        "motion", "Видео-анимация", "Моушн-дизайн под каждую фразу", "✨", ("#cc5de8", "#7950f2"),
+        "motion", "Видео-анимация", "Моушн-дизайн под каждую фразу", "sparkles", "visual",
         [
             files("media", "Видео или аудио с речью", "video/*,audio/*"),
             area("script", "…или текст сценария", "Если нет видео — вставьте текст"),
@@ -561,7 +561,7 @@ TOOLS: list[Tool] = [
         hint="Если загрузите видео или аудио, его расшифрует Gemini.",
     ),
     Tool(
-        "angles", "Ракурсы камеры", "Новые ракурсы из одного дубля", "🎥", ("#22b8cf", "#1c7ed6"),
+        "angles", "Ракурсы камеры", "Новые ракурсы из одного дубля", "video", "visual",
         [
             files("frame", "Кадр из видео (скриншот)", "image/*", required=True),
             select("count", "Сколько ракурсов", ["3", "4", "6"], "4"),
@@ -573,7 +573,7 @@ TOOLS: list[Tool] = [
         hint="Полученные кадры можно анимировать в Seedance/Kling по промптам анимации.",
     ),
     Tool(
-        "voices", "Голоса", "Озвучка, клон и замена голоса", "🎙️", ("#ffa94d", "#f76707"),
+        "voices", "Голоса", "Озвучка, клон и замена голоса", "mic", "media",
         [
             select("mode", "Режим", [("tts", "Озвучить текст"), ("sts", "Заменить голос в аудио/видео"),
                                      ("clone", "Клонировать голос")]),
@@ -593,7 +593,7 @@ TOOLS: list[Tool] = [
         hint="Работает через ElevenLabs. Клонирование доступно на платных тарифах ElevenLabs.",
     ),
     Tool(
-        "character", "Карточка персонажа", "Карточка из 3 фото", "🎭", ("#ff8787", "#f03e3e"),
+        "character", "Карточка персонажа", "Карточка из 3 фото", "user", "visual",
         [
             files("photos", "Фото персонажа (до 3)", "image/*", required=True, multiple=True, max_files=3),
             text("name", "Имя персонажа", "Необязательно"),
