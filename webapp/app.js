@@ -50,6 +50,7 @@ const ICONS = {
   play: '<path d="M6 3.5v17a.5.5 0 0 0 .76.43l14-8.5a.5.5 0 0 0 0-.86l-14-8.5A.5.5 0 0 0 6 3.5Z"/>',
   bookmark: '<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/>',
   arrow: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
+  scissors: '<circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/>',
 };
 
 function icon(name, cls = "") {
@@ -73,7 +74,7 @@ const THEMES = [
 ];
 const STATUS_TEXT = ["Отправляю запрос…", "Модель анализирует задачу…", "Пишу результат…", "Ещё немного…", "Почти готово…"];
 const STATUS_LONG = ["Загружаю файлы…", "Задача в очереди…", "Генерирую — это занимает 1–5 минут…", "Всё ещё работаю, можно свернуть приложение…", "Почти готово…"];
-const LONG_TOOLS = ["video_gen", "video_edit", "voices", "motion"];
+const LONG_TOOLS = ["video_gen", "video_edit", "voices", "motion", "clips", "sound"];
 const REFINE_CHIPS = ["Короче", "Подробнее", "Больше вариантов", "Смелее и ярче", "Проще язык"];
 
 // ================= Состояние =================
@@ -95,7 +96,7 @@ const S = {
   characters: null,   // кэш библиотеки
   jobId: "",          // последняя задача открытого раздела
   lastText: "",
-  settings: Object.assign({ provider: "", lang: "ru", toChat: true, theme: "indigo" }, load("settings", {})),
+  settings: Object.assign({ provider: "", lang: "ru", toChat: true, theme: "indigo", confirmCost: true }, load("settings", {})),
 };
 
 // ================= Утилиты =================
@@ -737,6 +738,56 @@ function skeletonHTML(long) {
     <div class="foot-note">${icon("info", "sm")}Можно закрыть приложение — результат сохранится в истории и придёт в чат.</div>`;
 }
 
+// ---------- оценка стоимости ----------
+
+function mediaDuration(file) {
+  return new Promise((resolve) => {
+    if (!file) return resolve(0);
+    const el = document.createElement(file.type.startsWith("audio/") ? "audio" : "video");
+    const url = URL.createObjectURL(file);
+    const done = (v) => { URL.revokeObjectURL(url); resolve(v); };
+    el.preload = "metadata";
+    el.onloadedmetadata = () => done(Number.isFinite(el.duration) ? el.duration : 0);
+    el.onerror = () => done(0);
+    setTimeout(() => done(0), 4000);
+    el.src = url;
+  });
+}
+
+/** Примерная цена запуска в USD (только для дорогих разделов). */
+async function estimateCost(tool) {
+  const P = (S.cfg && S.cfg.prices) || {};
+  const v = S.values;
+  const first = (name) => (S.files[name] || [])[0];
+  if (tool.id === "video_gen") {
+    const engine = v.engine || "veo";
+    const secs = engine === "omni" ? +v.seconds || 8 : Math.min(+v.seconds || 8, 8);
+    const rate = (P[engine] || {})[v.resolution || "1080p"] || 0;
+    return { usd: rate * secs, note: engine === "omni" ? " (ориентировочно)" : "" };
+  }
+  if (tool.id === "video_edit") {
+    const secs = v.mode === "extend" ? 10 : (await mediaDuration(first("source"))) || 8;
+    return { usd: ((P.omni || {})[v.resolution || "1080p"] || 0) * secs, note: " (ориентировочно)" };
+  }
+  if (tool.id === "voices" && v.mode === "dub") {
+    const secs = await mediaDuration(first("source"));
+    return secs ? { usd: (P.dub_per_min || 0) * secs / 60, note: "" } : null;
+  }
+  if (tool.id === "sound") {
+    if (v.mode === "sfx") return { usd: P.sfx || 0, note: "" };
+    const secs = v.mode === "score" ? await mediaDuration(first("video")) : +v.seconds || 30;
+    return { usd: (P.music_per_min || 0) * secs / 60, note: "" };
+  }
+  return null;
+}
+
+function confirmAsync(text) {
+  return new Promise((resolve) => {
+    if (tg && tg.showConfirm && tg.initData) tg.showConfirm(text, (ok) => resolve(Boolean(ok)));
+    else resolve(window.confirm(text));
+  });
+}
+
 // ---------- фоновые задачи ----------
 
 function pending() { return load("pending", []); }
@@ -810,6 +861,15 @@ async function submit() {
     }
   }
 
+  if (S.settings.confirmCost !== false) {
+    const est = await estimateCost(tool);
+    const limit = S.cfg?.cost_confirm_usd ?? 0.5;
+    if (est && est.usd >= limit) {
+      const ok = await confirmAsync(`Примерная стоимость: $${est.usd.toFixed(2)}${est.note}. Запустить?`);
+      if (!ok) return;
+    }
+  }
+
   const fd = new FormData();
   for (const f of tool.fields) {
     if (!visible(f)) continue;
@@ -859,7 +919,8 @@ function canMakeVideo() { const p = providers(); return p.gemini || p.openai; }
 
 function resultHTML(res, { meta = "", rerun = false, job = "" } = {}) {
   const imgs = res.images || [];
-  const hasMedia = imgs.length || res.audio || res.video;
+  const clips = res.videos || [];
+  const hasMedia = imgs.length || res.audio || res.video || clips.length;
   let body = "";
   if (res.chat_note) body += `<div class="notice">${icon("info")}<div>${esc(res.chat_note)}</div></div>`;
   if (imgs.length) {
@@ -867,6 +928,10 @@ function resultHTML(res, { meta = "", rerun = false, job = "" } = {}) {
       `<a href="${u}" data-open><img src="${u}" alt="" loading="lazy"></a>`).join("")}</div>`;
   }
   if (res.video) body += `<video class="player" src="${res.video}" controls playsinline></video>`;
+  if (clips.length) {
+    body += `<div class="clips">${clips.map((u, i) => `<div class="clip"><div class="clip-n">Клип ${i + 1}</div>
+      <video class="player" src="${u}" controls playsinline preload="metadata"></video></div>`).join("")}</div>`;
+  }
   if (res.audio) body += `<audio class="player" src="${res.audio}" controls></audio>`;
   if (res.text) body += `<div class="md">${markdown(res.text)}</div>`;
 
@@ -1021,7 +1086,7 @@ function addHistory(tool, res, model, job) {
     job,
     refinable: Boolean(res.refinable),
     text: (res.text || "").slice(0, 40000),
-    media: (res.images || []).length + (res.audio ? 1 : 0) + (res.video ? 1 : 0),
+    media: (res.images || []).length + (res.audio ? 1 : 0) + (res.video ? 1 : 0) + (res.videos || []).length,
   };
   items.unshift(item);
   save("history", items.slice(0, 60));
@@ -1166,6 +1231,12 @@ function renderSettings() {
       <input type="checkbox" id="toChat" ${st.toChat ? "checked" : ""}><i class="switch"></i></label>
     <p class="muted" style="font-size:12.5px;margin:8px 4px 0">Изображения, аудио и видео отправляются в чат всегда.</p>
 
+    <div class="group-label">Расходы</div>
+    <label class="switch-row"><span>Спрашивать перед дорогими операциями</span>
+      <input type="checkbox" id="confirmCost" ${st.confirmCost !== false ? "checked" : ""}><i class="switch"></i></label>
+    <p class="muted" style="font-size:12.5px;margin:8px 4px 0">Видео, редактор и дубляж: бот покажет примерную цену от
+      $${(S.cfg.cost_confirm_usd ?? 0.5).toFixed(2)} и запустит только после подтверждения.</p>
+
     <div class="group-label">Сервисы</div>
     <div class="list">${Object.keys(SERVICE_NAMES).map((k) => `
       <div class="list-row"><span class="dot ${p[k] ? "" : "off"}"></span>
@@ -1194,6 +1265,7 @@ function renderSettings() {
     };
   });
   $view.querySelector("#toChat").onchange = (e) => { st.toChat = e.target.checked; saveSettings(); };
+  $view.querySelector("#confirmCost").onchange = (e) => { st.confirmCost = e.target.checked; saveSettings(); };
   $view.querySelector("#clear").onclick = () => {
     const doClear = () => { save("history", []); toast("История очищена", "trash"); };
     if (tg && tg.showConfirm && tg.initData) tg.showConfirm("Удалить всю историю?", (ok) => ok && doClear());

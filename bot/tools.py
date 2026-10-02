@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from . import config, prompt_rules
-from .ai import images, llm, media, subtitles, video, voice
+from .ai import images, llm, media, reframe, subtitles, video, voice
 from .ai.llm import AIError, Media
 
 log = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ class Result:
     images: list[bytes] = field(default_factory=list)
     audio: bytes | None = None
     video: bytes | None = None
+    videos: list[bytes] = field(default_factory=list)  # несколько роликов (например, нарезка клипов)
     # Кнопки перехода в другие разделы: {label, tool, values, files: {поле: {"image": i} | {"from_field": имя}}}
     followups: list[dict] = field(default_factory=list)
     character: dict | None = None  # данные для сохранения персонажа в библиотеку
@@ -120,7 +121,11 @@ PRODUCER = (
     "Ты — опытный креативный продюсер, сценарист и режиссёр коротких вертикальных видео "
     "(Reels, TikTok, YouTube Shorts) и эксперт по AI-видео и AI-изображениям "
     "(Seedance, Kling, Veo, Gemini Omni, Runway, Hailuo, Grok Imagine, Midjourney, GPT Image, Nano Banana). "
-    "Отвечаешь конкретно, без воды и общих советов, сразу готовым к использованию результатом."
+    "Отвечаешь конкретно, без воды и общих советов, сразу готовым к использованию результатом.\n"
+    "Правила коротких видео, которые ты соблюдаешь: хук в первые 1–2 секунды (зритель решает, остаться ли, в "
+    "среднем за 1,7 с) — начинай с самого сильного, без вступлений; смена плана или «паттерн-интеррапт» каждые "
+    "2–4 секунды; субтитры обязательны (большинство смотрит без звука); важное в кадре не ставь в нижние ~16% и "
+    "правые ~11% вертикального кадра — там интерфейс Reels/TikTok; финал — вывод, панчлайн или клиффхэнгер."
 )
 
 LANG_NAMES = {"ru": "русском", "uz": "узбекском (латиница)", "en": "английском"}
@@ -308,6 +313,18 @@ VIDEO_STUDY_TASKS = {
         "## 3. Адаптированный текст для дубляжа (язык: {target_lang}): естественная живая речь, "
         "каждая реплика по длине укладывается в свой таймкод. Дай его одним блоком, готовым для озвучки.\n"
         "В конце подскажи: озвучить текст можно в разделе «Голоса»."
+    ),
+    "remake": (
+        "Это видео — РЕФЕРЕНС. Пользователь хочет снять похожее, но на новую тему (см. данные пользователя).\n"
+        "## 1. Разбор референса\n- **Содержание:** 2 предложения.\n- **Стиль:** темп, визуальная подача, энергия.\n"
+        "- **Структура:** сколько сцен за сколько секунд, ритм монтажа.\n- **Движение:** какие сцены — живое видео "
+        "или AI-видео, какие — статичные картинки с наездом/панорамой, какие — статика. Не угадывай: смотри на кадры.\n"
+        "- **Почему работает:** 2–3 конкретных приёма (хук, ритм, переходы, подача).\n"
+        "## 2. Разбор планов по 5 аспектам (по группам планов, с таймкодами)\n"
+        "Субъект · Движение субъекта · Сцена (надписи и графику перечисли отдельно) · Крупность и композиция · Камера.\n"
+        "## 3. Три разные концепции на новую тему\nДля каждой: **что берём** из референса (темп, хук, структура, "
+        "тон), **что меняем** (тема, визуал, угол, подача), сценарий с таймкодами той же длины и промпт ```prompt "
+        "для выбранного генератора на каждую сцену."
     ),
     "replace": (
         "Подготовь замену персонажа в приложенном видео:\n"
@@ -712,6 +729,184 @@ async def run_video_edit(tool: Tool, ctx: RunContext) -> Result:
     return Result(text=f"✅ {label} в Gemini Omni Flash 1.1.", video=clip)
 
 
+# ---------- нарезка клипов ----------
+
+CLIP_RANGES = {"short": (15, 30), "mid": (30, 60), "long": (60, 90)}
+
+CLIP_EDITOR = (
+    "Ты — редактор коротких вертикальных видео (Reels, TikTok, Shorts). Из длинного видео ты выбираешь моменты, "
+    "которые станут сильными самостоятельными клипами. Критерии (по убыванию важности): 1) хук — клип открывается "
+    "самой цепляющей фразой, а не вступлением, зритель решает остаться за 1–2 секунды; 2) понятен без контекста "
+    "всего видео; 3) одна законченная мысль, финал — вывод, панчлайн или эмоция, а не обрыв на полуслове; "
+    "4) польза или эмоция; 5) энергия и темп речи. Ранжируй по силе, а не по порядку в видео. "
+    "Не выбирай пересекающиеся моменты."
+)
+
+
+def snap_clip(start: float, end: float, phrases: list, lo: float, hi: float, total: float) -> tuple[float, float]:
+    """Подгоняет границы клипа к началу и концу фраз и укладывает длину в диапазон lo–hi секунд."""
+    if phrases:
+        first = min(phrases, key=lambda p: abs(p.start - start))
+        last_candidates = [p for p in phrases if p.end > first.start]
+        last = min(last_candidates, key=lambda p: abs(p.end - end)) if last_candidates else first
+        start, end = first.start, last.end
+        following = [p for p in phrases if p.start >= first.start]
+        if end - start < lo:  # слишком коротко — добавляем следующие фразы
+            for p in following:
+                if p.end - start >= lo or p.end - start > hi:
+                    break
+                end = p.end
+            end = max(end, next((p.end for p in following if p.end - start >= lo and p.end - start <= hi), end))
+        if end - start > hi:  # слишком длинно — обрезаем по последней фразе, которая помещается
+            fitting = [p.end for p in following if p.end - start <= hi]
+            end = fitting[-1] if fitting else start + hi
+    else:
+        end = min(max(end, start + lo), start + hi)
+    start = max(0.0, start - 0.1)
+    end = min(total or end + 0.3, end + 0.3)
+    return round(start, 2), round(end, 2)
+
+
+def pick_clips(candidates: list[dict], phrases: list, lo: float, hi: float, count: int, total: float) -> list[dict]:
+    chosen: list[dict] = []
+    for c in sorted(candidates, key=lambda c: -float(c.get("score", 0) or 0)):
+        try:
+            start, end = snap_clip(float(c["start"]), float(c["end"]), phrases, lo, hi, total)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end - start < lo * 0.6:  # заметно короче заказанного — это не клип, а обрывок
+            continue
+        overlap = any(min(end, x["end"]) - max(start, x["start"]) > 0.4 * (end - start) for x in chosen)
+        if overlap:
+            continue
+        chosen.append({**c, "start": start, "end": end})
+        if len(chosen) >= count:
+            break
+    return chosen
+
+
+def clip_ass(words: list[dict], start: float, end: float, size: tuple[int, int], style: str) -> str | None:
+    inside = [{**w, "start": float(w["start"]) - start, "end": float(w.get("end") or w["start"]) - start}
+              for w in words if w.get("start") is not None and start <= float(w["start"]) < end]
+    phrases = subtitles.phrases_from_words(inside)
+    return subtitles.to_ass(phrases, size[0], size[1], style) if phrases else None
+
+
+async def run_clips(tool: Tool, ctx: RunContext) -> Result:
+    src = ctx.f("source")
+    if not src or not src[0].is_video:
+        raise AIError("Загрузите видео.")
+    source = src[0]
+    providers = config.available_providers()
+    total = await media.probe_duration(source)
+    vertical, track = ctx.flag("vertical"), ctx.flag("vertical")
+    style = ctx.v("style", "Kinetic typography")
+    words: list[dict] = []
+    if providers["elevenlabs"]:
+        words = (await voice.transcribe(source)).get("words", [])
+    want_subs = ctx.flag("subtitles") and bool(words)
+    w, h = await media.probe_size(source)
+    out_size = reframe.output_size(w, h, vertical)
+
+    if ctx.v("mode") == "reframe":
+        ass = clip_ass(words, 0, total + 1, out_size, style) if want_subs else None
+        clip = await reframe.render_vertical(source, 0, total, ass, track, vertical)
+        note = "" if words or not ctx.flag("subtitles") else "\n\n⚠️ Субтитры не добавлены: нужен ключ ElevenLabs."
+        return Result(text="✅ Видео переведено в вертикальный формат 9:16, кадр следует за лицом." + note, video=clip)
+
+    lo, hi = CLIP_RANGES.get(ctx.v("length"), CLIP_RANGES["mid"])
+    count = int(ctx.v("count", "5"))
+    lang = LANG_NAMES.get(ctx.lang, "русском")
+    ask_json = (
+        f"Предложи {count * 2} кандидатов в клипы длиной {lo}–{hi} секунд. Верни ТОЛЬКО JSON:\n"
+        '{"clips": [{"start": 12.3, "end": 48.0, "score": 9, "title": "заголовок до 60 символов", '
+        '"hook": "текст-хук на экран, до 6 слов", "why": "почему это сильный клип", '
+        '"caption": "текст поста с 3–5 хэштегами"}]}\n'
+        f"start/end — секунды от начала видео. Поля title, hook, why, caption пиши на {lang} языке."
+    )
+    phrases = subtitles.phrases_from_words(words, max_words=10) if words else []
+    if phrases:
+        prompt = f"{ask_json}\n\nРасшифровка с таймкодами (секунды):\n{subtitles.timeline(phrases)}"
+        raw = await llm.generate_text(ctx.provider, CLIP_EDITOR, prompt)
+    else:  # без ElevenLabs — моменты выбирает Gemini, глядя на само видео
+        llm.require("gemini")
+        raw = await llm.generate_text("gemini", CLIP_EDITOR, f"{ask_json}\nВидео длительностью {total:.0f} с приложено.",
+                                      [source])
+    clips = pick_clips(extract_json(raw).get("clips", []), phrases, lo, hi, count, total)
+    if not clips:
+        raise AIError("Не удалось найти подходящие моменты. Попробуйте другую длину клипа.")
+
+    result = Result()
+    md = [f"Найдено клипов: **{len(clips)}** (отсортированы по силе). Каждый — отдельным видео ниже."]
+    for i, c in enumerate(clips, 1):
+        ass = clip_ass(words, c["start"], c["end"], out_size, style) if want_subs else None
+        result.videos.append(await reframe.render_vertical(source, c["start"], c["end"], ass, track, vertical))
+        block = [f"## {i}. {c.get('title') or 'Клип'} · {c.get('score', '?')}/10",
+                 f"⏱ {c['start']:.0f}–{c['end']:.0f} с ({c['end'] - c['start']:.0f} с)"
+                 + (f" · хук на экран: **{c['hook']}**" if c.get("hook") else "")]
+        if c.get("why"):
+            block.append(str(c["why"]))
+        if c.get("caption"):
+            block.append(f"**Текст поста:**\n```text\n{c['caption']}\n```")
+        md.append("\n\n".join(block))
+    if ctx.flag("subtitles") and not words:
+        md.append("⚠️ Субтитры не добавлены: для точной расшифровки нужен ключ ElevenLabs.")
+    result.text = "\n\n".join(md)
+    return result
+
+
+# ---------- музыка и звуки ----------
+
+MUSIC_PROMPT_GUIDE = (
+    "Перепиши запрос в промпт для генератора музыки Eleven Music (на английском, 1–3 предложения): жанр, "
+    "настроение, темп (BPM), ключевые инструменты, развитие (вступление, нарастание, финал), для чего трек "
+    "(фон для Reels под голос — значит без резких пиков и без вокала, если не просили). Без названий реальных "
+    "песен и имён исполнителей. Верни только промпт."
+)
+
+
+async def run_sound(tool: Tool, ctx: RunContext) -> Result:
+    llm.require("elevenlabs")
+    mode = ctx.v("mode", "music")
+    providers = config.available_providers()
+    llm_provider = next((p for p in (ctx.provider, "claude", "openai", "gemini") if providers.get(p)), "")
+
+    if mode == "sfx":
+        if not ctx.v("prompt"):
+            raise AIError("Опишите звук, например: «дверь скрипит и захлопывается».")
+        text = ctx.v("prompt")
+        if llm_provider and re.search(r"[А-Яа-яЁё]", text):  # эффекты лучше понимают английский
+            text = (await llm.generate_text(llm_provider, "Переведи описание звукового эффекта на английский, "
+                                            "кратко и конкретно. Верни только перевод.", text)).strip()
+        audio = await voice.sound_effect(text, float(ctx.v("sfx_seconds", "5")), ctx.flag("loop"))
+        return Result(text=f"**Эффект:** {text}", audio=audio)
+
+    if mode == "score":  # музыка под готовое видео
+        src = ctx.f("video")
+        if not src or not src[0].is_video:
+            raise AIError("Загрузите видео.")
+        seconds = await media.probe_duration(src[0])
+        brief = ctx.v("prompt")
+        if not brief and providers["gemini"]:
+            brief = await llm.generate_text("gemini", MUSIC_PROMPT_GUIDE,
+                                            "Посмотри видео и подбери к нему фоновую музыку.", [src[0]])
+        elif brief and llm_provider:
+            brief = await llm.generate_text(llm_provider, MUSIC_PROMPT_GUIDE, brief)
+        brief = (brief or "Calm modern background music for a short vertical video, no vocals").strip()
+        music = await voice.compose_music(brief, min(seconds + 1, 600), True)
+        clip = await media.mix_music(src[0], music, ctx.v("level", "mid"))
+        return Result(text=f"✅ Музыка подложена под видео и приглушается, когда звучит голос.\n\n"
+                           f"**Промпт музыки:**\n```text\n{brief}\n```", video=clip)
+
+    if not ctx.v("prompt"):
+        raise AIError("Опишите музыку: жанр, настроение, для чего она.")
+    prompt = ctx.v("prompt")
+    if ctx.flag("enhance") and llm_provider:
+        prompt = (await llm.generate_text(llm_provider, MUSIC_PROMPT_GUIDE, prompt)).strip()
+    audio = await voice.compose_music(prompt, float(ctx.v("seconds", "30")), not ctx.flag("vocals"))
+    return Result(text=f"**Промпт музыки:**\n```text\n{prompt}\n```", audio=audio)
+
+
 # ---------- список разделов ----------
 
 TOOLS: list[Tool] = [
@@ -749,13 +944,15 @@ TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        "video_study", "Разбор видео", "Перевод и замена персонажа", "scan", "media",
+        "video_study", "Разбор видео", "Ремейк, перевод, замена персонажа", "scan", "media",
         [
             files("video", "Видео", "video/*", required=True),
-            select("mode", "Что сделать", [("full", "Полный разбор + промпты"), ("translate", "Перевод речи"),
-                                          ("replace", "Замена персонажа")]),
+            select("mode", "Что сделать", [("full", "Полный разбор + промпты"), ("remake", "Сделать похожее про…"),
+                                          ("translate", "Перевод речи"), ("replace", "Замена персонажа")]),
+            area("new_topic", "Новая тема", "Например: то же самое, но про кофейню в Ташкенте", required=True,
+                 show_if={"mode": ["remake"]}),
             select("target", "Промпты сцен под генератор", prompt_rules.TARGET_OPTIONS,
-                   show_if={"mode": ["full", "replace"]}),
+                   show_if={"mode": ["full", "replace", "remake"]}),
             select("target_lang", "Язык перевода", OUT_LANGS),
             area("new_character", "Новый персонаж", "Опишите, на кого заменить (необязательно)"),
             files("character_photo", "Фото нового персонажа", "image/*"),
@@ -957,6 +1154,23 @@ TOOLS: list[Tool] = [
              "сохраняя движения и камеру. «Продлить» добавляет до 10 секунд продолжения.",
     ),
     Tool(
+        "clips", "Нарезка клипов", "Лучшие моменты длинного видео — в Reels", "scissors", "media",
+        [
+            files("source", "Длинное видео (эфир, подкаст, интервью)", "video/*", required=True),
+            select("mode", "Что сделать", [("clips", "Нарезать клипы"), ("reframe", "Только 9:16")]),
+            select("count", "Сколько клипов", ["3", "5", "8"], "5", show_if={"mode": ["clips"]}),
+            select("length", "Длина клипа", [("short", "15–30 с"), ("mid", "30–60 с"), ("long", "60–90 с")], "mid",
+                   show_if={"mode": ["clips"]}),
+            check("vertical", "Вертикально 9:16, кадр следует за лицом", True),
+            check("subtitles", "Анимированные субтитры", True),
+            select("style", "Стиль субтитров", list(subtitles.PRESETS), show_if={"subtitles": ["1"]}),
+        ],
+        run=run_clips,
+        hint="Речь расшифровывается ElevenLabs Scribe v2, лучшие моменты выбирает выбранная модель (хук в первые "
+             "секунды, законченная мысль), каждый клип кадрируется по лицу и получает субтитры. Без ElevenLabs "
+             "моменты выбирает Gemini по самому видео, но без субтитров.",
+    ),
+    Tool(
         "voices", "Голоса", "Озвучка, клон и замена голоса", "mic", "media",
         [
             select("mode", "Режим", [("tts", "Озвучить текст"), ("dub", "Дубляж видео на другой язык"),
@@ -980,6 +1194,27 @@ TOOLS: list[Tool] = [
         run=run_voices, uses_llm=False, needs=("elevenlabs",),
         hint="ElevenLabs: озвучка Eleven v4 (90+ языков, включая узбекский), дубляж Dubbing v2 голосами самих "
              "спикеров с сохранением музыки, расшифровка Scribe v2. Для клона хватит 10 секунд чистой речи.",
+    ),
+    Tool(
+        "sound", "Музыка и звуки", "Трек, звуковой эффект, музыка под видео", "music", "media",
+        [
+            select("mode", "Что сделать", [("music", "Музыка"), ("sfx", "Эффект"), ("score", "Под видео")]),
+            files("video", "Видео", "video/*", required=True, show_if={"mode": ["score"]}),
+            area("prompt", "Описание", "Музыка: «энергичный хаус для фитнес-рилс». Эффект: «скрип двери». "
+                 "Под видео — можно оставить пустым, Gemini подберёт сам"),
+            select("seconds", "Длительность трека", [("15", "15 с"), ("30", "30 с"), ("60", "60 с"), ("120", "2 мин")],
+                   "30", show_if={"mode": ["music"]}),
+            check("vocals", "С вокалом", False, show_if={"mode": ["music"]}),
+            check("enhance", "Улучшить описание с помощью ИИ", True, show_if={"mode": ["music"]}),
+            select("sfx_seconds", "Длительность эффекта", [("2", "2 с"), ("5", "5 с"), ("10", "10 с"), ("20", "20 с")],
+                   "5", show_if={"mode": ["sfx"]}),
+            check("loop", "Бесшовный цикл", False, show_if={"mode": ["sfx"]}),
+            select("level", "Громкость музыки", [("low", "Тихо"), ("mid", "Средне"), ("high", "Громко")], "mid",
+                   show_if={"mode": ["score"]}),
+        ],
+        run=run_sound, needs=("elevenlabs",),
+        hint="ElevenLabs: Eleven Music и Sound Effects. В режиме «Под видео» музыка зацикливается до длины ролика "
+             "и автоматически приглушается, когда кто-то говорит.",
     ),
     Tool(
         "character", "Карточка персонажа", "Карточка из 3 фото", "user", "visual",
@@ -1014,4 +1249,26 @@ async def run_tool(tool: Tool, ctx: RunContext) -> Result:
                 raise AIError(f"Заполните поле «{f['label']}».")
     if tool.uses_llm and not providers.get(ctx.provider):
         ctx.provider = next((p for p in ("claude", "openai", "gemini") if providers[p]), ctx.provider)
-    return await (tool.run or run_text)(tool, ctx)
+    result = await (tool.run or run_text)(tool, ctx)
+    await check_videos(tool, ctx, result)
+    return result
+
+
+async def check_videos(tool: Tool, ctx: RunContext, result: Result) -> None:
+    """Проверяет готовые видео перед отправкой и дописывает предупреждения (не отправляем «молча» брак)."""
+    clips = ([result.video] if result.video else []) + result.videos
+    expected = None
+    if tool.id == "video_gen" and ctx.v("engine") != "omni":
+        expected = prompt_rules.clamp_seconds("veo", int(ctx.v("seconds", "8") or 8))
+    notes = []
+    for i, clip in enumerate(clips, 1):
+        try:
+            issues = await media.qa_video(clip, expect_audio=True, expected_seconds=expected)
+        except Exception as e:  # проверка не должна ломать результат
+            log.warning("video QA failed: %s", e)
+            continue
+        if issues:
+            label = f"клип {i}: " if len(clips) > 1 else ""
+            notes.append(label + "; ".join(issues))
+    if notes:
+        result.text = (result.text + "\n\n" if result.text else "") + "⚠️ **Проверка видео:** " + " · ".join(notes)

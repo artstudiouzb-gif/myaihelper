@@ -76,9 +76,16 @@ def clamp_seconds(generator: str, seconds: int) -> int:
     return max(4, min(seconds, gen.max_seconds))
 
 
+CONTINUITY_RULE = (
+    "НЕПРЕРЫВНОСТЬ: 3–6 отличительных примет героя (лицо, причёска, одежда, цвета) повторяй ДОСЛОВНО в каждом "
+    "шоте/отрезке и в каждом промпте — «the same character», «he/she again» генераторы не понимают. Одна идея "
+    "освещения на ролик. Реплики на быстрой склейке — не длиннее ~6 слов."
+)
+
+
 def rules_for(generator: str, seconds: int) -> str:
     gen = GENERATORS.get(generator, GENERATORS["veo"])
-    return gen.rules.replace("{seconds}", str(clamp_seconds(generator, seconds)))
+    return gen.rules.replace("{seconds}", str(clamp_seconds(generator, seconds))) + "\n" + CONTINUITY_RULE
 
 
 # ---------- проверка готовых промптов ----------

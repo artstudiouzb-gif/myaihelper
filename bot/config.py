@@ -56,8 +56,22 @@ ELEVENLABS_TTS_FAST_MODEL = _env("ELEVENLABS_TTS_FAST_MODEL", "eleven_v4_turbo")
 ELEVENLABS_STS_MODEL = _env("ELEVENLABS_STS_MODEL", "eleven_multilingual_sts_v2")
 ELEVENLABS_DUBBING_MODEL = _env("ELEVENLABS_DUBBING_MODEL", "dubbing_v2")
 ELEVENLABS_STT_MODEL = _env("ELEVENLABS_STT_MODEL", "scribe_v2")
+ELEVENLABS_MUSIC_MODEL = _env("ELEVENLABS_MUSIC_MODEL", "music_v2_5")
+ELEVENLABS_SFX_MODEL = _env("ELEVENLABS_SFX_MODEL", "eleven_text_to_sound_v2")
 
 MAX_UPLOAD_MB = int(_env("MAX_UPLOAD_MB", "200"))
+
+# Цены для оценки стоимости перед запуском (USD, октябрь 2026). Omni — ориентировочно: официальной цены за секунду нет.
+PRICES = {
+    "veo": {"720p": 0.40, "1080p": 0.40, "4k": 0.60},  # за секунду, со звуком
+    "veo_fast": {"720p": 0.10, "1080p": 0.12, "4k": 0.30},
+    "omni": {"720p": 0.15, "1080p": 0.25, "4k": 0.45},
+    "dub_per_min": 2.20,  # ElevenLabs Dubbing v2
+    "music_per_min": 0.15,  # Eleven Music
+    "sfx": 0.12,  # звуковой эффект за генерацию
+    "stt_per_hour": 0.22,  # Scribe v2
+}
+COST_CONFIRM_USD = float(_env("COST_CONFIRM_USD", "0.5"))  # с какой суммы спрашивать подтверждение
 
 
 def available_providers() -> dict[str, bool]:

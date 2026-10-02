@@ -65,6 +65,8 @@ async def api_config(request: web.Request) -> web.Response:
             "claude": config.CLAUDE_MODEL, "openai": config.OPENAI_MODEL, "gemini": config.GEMINI_MODEL,
             "elevenlabs": config.ELEVENLABS_TTS_MODEL,
         },
+        "prices": config.PRICES,
+        "cost_confirm_usd": config.COST_CONFIRM_USD,
         "stack": [
             ["Текст", f"{config.CLAUDE_MODEL} · {config.OPENAI_MODEL} · {config.GEMINI_MODEL}"],
             ["Изображения", f"{config.GEMINI_IMAGE_MODEL} · {config.GEMINI_IMAGE_MODEL_PRO} · "
@@ -127,6 +129,7 @@ def serialize(result: Result, chat_note: str, refinable: bool) -> dict:
         "images": images,
         "audio": store_media(result.audio, "audio/mpeg") if result.audio else None,
         "video": video_url,
+        "videos": [store_media(v, "video/mp4") for v in result.videos],
         "chat_note": chat_note,
         "followups": followups,
         "character": result.character,
@@ -256,12 +259,17 @@ async def send_to_chat(bot: Bot | None, chat_id: int, title: str, result: Result
         elif result.images:
             group = [InputMediaPhoto(media=BufferedInputFile(img, f"image{i}.png")) for i, img in enumerate(result.images[:10])]
             await bot.send_media_group(chat_id, group)
-        if result.video:
-            if len(result.video) > TG_UPLOAD_LIMIT:
-                return "Видео больше 50 МБ — его можно скачать только из приложения."
-            await bot.send_video(chat_id, BufferedInputFile(result.video, "video.mp4"), caption=title)
-        elif result.audio:
+        too_big = False
+        for i, clip in enumerate(([result.video] if result.video else []) + result.videos, 1):
+            if len(clip) > TG_UPLOAD_LIMIT:
+                too_big = True
+                continue
+            caption = title if not result.videos else f"{title} · {i}"
+            await bot.send_video(chat_id, BufferedInputFile(clip, f"video{i}.mp4"), caption=caption)
+        if result.audio and not (result.video or result.videos):
             await bot.send_audio(chat_id, BufferedInputFile(result.audio, "voice.mp3"), caption=title)
+        if too_big:
+            return "Часть видео больше 50 МБ — их можно скачать только из приложения."
     except Exception as e:
         log.warning("send to chat failed: %s", e)
         return "Не удалось отправить результат в чат."

@@ -39,7 +39,7 @@ async def list_voices() -> list[dict]:
 
 async def text_to_speech(voice_id: str, text: str, fast: bool = False) -> bytes:
     """Eleven v4 понимает теги эмоций прямо в тексте: [laughs], [whispers], [excited] и т.п."""
-    url = f"{API}/text-to-speech/{voice_id}?output_format=mp3_44100_192"
+    url = f"{API}/text-to-speech/{voice_id}?output_format=mp3_44100_128"
     body = {
         "text": text,
         "model_id": config.ELEVENLABS_TTS_FAST_MODEL if fast else config.ELEVENLABS_TTS_MODEL,
@@ -144,3 +144,29 @@ async def transcribe(media: Media, language: str = "") -> dict:
         async with s.post(f"{API}/speech-to-text", headers=_headers(), data=form) as r:
             await _check(r)
             return await r.json()
+
+
+# --- Музыка (Eleven Music) и звуковые эффекты ---
+
+
+async def compose_music(prompt: str, seconds: float, instrumental: bool = True) -> bytes:
+    body = {
+        "prompt": prompt,
+        "music_length_ms": int(min(max(seconds, 3), 600) * 1000),
+        "model_id": config.ELEVENLABS_MUSIC_MODEL,
+        "force_instrumental": instrumental,
+    }
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
+        async with s.post(f"{API}/music?output_format=auto", headers=_headers(), json=body) as r:
+            await _check(r)
+            return await r.read()
+
+
+async def sound_effect(text: str, seconds: float | None = None, loop: bool = False) -> bytes:
+    body = {"text": text, "model_id": config.ELEVENLABS_SFX_MODEL, "prompt_influence": 0.5, "loop": loop}
+    if seconds:
+        body["duration_seconds"] = min(max(seconds, 0.5), 30)
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
+        async with s.post(f"{API}/sound-generation?output_format=mp3_44100_128", headers=_headers(), json=body) as r:
+            await _check(r)
+            return await r.read()

@@ -16,7 +16,8 @@ class Phrase:
         return " ".join(w for w, _, _ in self.words)
 
 
-def phrases_from_words(words: list[dict], max_words: int = 4, max_gap: float = 0.6) -> list[Phrase]:
+def phrases_from_words(words: list[dict], max_words: int = 4, max_gap: float = 0.6,
+                       max_chars: int = 56) -> list[Phrase]:
     items = [w for w in words if w.get("type", "word") == "word" and w.get("start") is not None]
     phrases: list[Phrase] = []
     current: list[tuple[str, float, float]] = []
@@ -24,7 +25,8 @@ def phrases_from_words(words: list[dict], max_words: int = 4, max_gap: float = 0
         text, start, end = w["text"].strip(), float(w["start"]), float(w.get("end") or w["start"])
         if not text:
             continue
-        if current and (len(current) >= max_words or start - current[-1][2] > max_gap):
+        too_long = sum(len(w) + 1 for w, _, _ in current) + len(text) > max_chars  # 2 строки по ~28 символов
+        if current and (len(current) >= max_words or too_long or start - current[-1][2] > max_gap):
             phrases.append(Phrase(current[0][1], current[-1][2], current))
             current = []
         current.append((text, start, end))
@@ -80,7 +82,11 @@ def _escape(text: str) -> str:
 def to_ass(phrases: list[Phrase], width: int, height: int, style: str) -> str:
     p = PRESETS.get(style, PRESETS["Kinetic typography"])
     size = int(min(width, height) * p["size"] * (1.25 if height > width else 1))
-    margin_v = int(height * (0.2 if height > width else 0.1))
+    vertical = height > width
+    # безопасные зоны Reels/TikTok/Shorts: снизу ~16% и справа ~11% кадра закрывает интерфейс платформы
+    margin_v = int(height * (0.2 if vertical else 0.1))
+    margin_l = int(width * 0.08)
+    margin_r = int(width * (0.13 if vertical else 0.08))
     border_style = 3 if p["box"] else 1
     back = "&H99000000" if p["box"] else "&H00000000"
     header = (
@@ -91,7 +97,7 @@ def to_ass(phrases: list[Phrase], width: int, height: int, style: str) -> str:
         "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Cap,{p['font']},{size},{p['hi']},{p['base']},{p['outline']},{back},-1,0,0,0,100,100,0,0,"
-        f"{border_style},{p['border']},{p['shadow']},2,{int(width * 0.08)},{int(width * 0.08)},{margin_v},1\n\n"
+        f"{border_style},{p['border']},{p['shadow']},2,{margin_l},{margin_r},{margin_v},1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     lines = []
