@@ -43,6 +43,9 @@ OPENAI_MODEL = _env("OPENAI_MODEL", "gpt-5.5")
 OPENAI_IMAGE_MODEL = _env("OPENAI_IMAGE_MODEL", "gpt-image-2")
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_IMAGE_MODEL = _env("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+# Пусто — выбрать самую свежую быструю модель Veo автоматически
+VEO_MODEL = _env("VEO_MODEL")
+SORA_MODEL = _env("SORA_MODEL", "sora-2")
 ELEVENLABS_TTS_MODEL = _env("ELEVENLABS_TTS_MODEL", "eleven_multilingual_v2")
 ELEVENLABS_STS_MODEL = _env("ELEVENLABS_STS_MODEL", "eleven_multilingual_sts_v2")
 

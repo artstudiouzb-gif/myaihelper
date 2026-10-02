@@ -45,6 +45,11 @@ const ICONS = {
   cpu: '<rect x="4" y="4" width="16" height="16" rx="2.5"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 1v3"/><path d="M15 1v3"/><path d="M9 20v3"/><path d="M15 20v3"/><path d="M20 9h3"/><path d="M20 14h3"/><path d="M1 9h3"/><path d="M1 14h3"/>',
   trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
   chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  wand: '<path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/>',
+  play: '<path d="M6 3.5v17a.5.5 0 0 0 .76.43l14-8.5a.5.5 0 0 0 0-.86l-14-8.5A.5.5 0 0 0 6 3.5Z"/>',
+  bookmark: '<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/>',
+  arrow: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
 };
 
 function icon(name, cls = "") {
@@ -67,6 +72,9 @@ const THEMES = [
   ["light", "Светлая", "#f4f5f8", "#5b4cff"],
 ];
 const STATUS_TEXT = ["Отправляю запрос…", "Модель анализирует задачу…", "Пишу результат…", "Ещё немного…", "Почти готово…"];
+const STATUS_LONG = ["Загружаю файлы…", "Задача в очереди…", "Генерирую — это занимает 1–5 минут…", "Всё ещё работаю, можно свернуть приложение…", "Почти готово…"];
+const LONG_TOOLS = ["video_gen", "voices"];
+const REFINE_CHIPS = ["Короче", "Подробнее", "Больше вариантов", "Смелее и ярче", "Проще язык"];
 
 // ================= Состояние =================
 
@@ -82,6 +90,11 @@ const S = {
   voices: null,
   query: "",
   cat: "all",
+  characterId: "",    // выбранный персонаж в форме
+  characterItem: null,
+  characters: null,   // кэш библиотеки
+  jobId: "",          // последняя задача открытого раздела
+  lastText: "",
   settings: Object.assign({ provider: "", lang: "ru", toChat: true, theme: "indigo" }, load("settings", {})),
 };
 
@@ -179,6 +192,63 @@ function engineTag(tool) {
   return "";
 }
 
+// ================= Библиотека персонажей (IndexedDB, хранится на устройстве) =================
+
+const CharDB = {
+  db: null,
+  open() {
+    if (this.db) return Promise.resolve(this.db);
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open("ai-studio", 1);
+      req.onupgradeneeded = () => req.result.createObjectStore("characters", { keyPath: "id" });
+      req.onsuccess = () => { this.db = req.result; resolve(this.db); };
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async tx(mode, fn) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const t = db.transaction("characters", mode);
+      const req = fn(t.objectStore("characters"));
+      t.oncomplete = () => resolve(req && req.result);
+      t.onerror = () => reject(t.error);
+    });
+  },
+  async all() { return ((await this.tx("readonly", (st) => st.getAll())) || []).sort((a, b) => b.ts - a.ts); },
+  put(item) { return this.tx("readwrite", (st) => st.put(item)); },
+  del(id) { return this.tx("readwrite", (st) => st.delete(id)); },
+};
+
+async function characters() {
+  if (!S.characters) {
+    try { S.characters = await CharDB.all(); } catch (e) { S.characters = []; console.warn(e); }
+  }
+  return S.characters;
+}
+
+function downscale(blob, max = 1024) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      const k = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * k);
+      c.height = Math.round(img.height * k);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      c.toBlob((b) => resolve(b || blob), "image/jpeg", 0.88);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(blob); };
+    img.src = url;
+  });
+}
+
+async function urlToFile(url, name) {
+  const blob = await (await fetch(url)).blob();
+  return new File([blob], name, { type: blob.type || "image/png" });
+}
+
 // ================= Тема =================
 
 function applyTheme() {
@@ -227,8 +297,10 @@ function inline(s) {
 
 function codeBlock(code, lang) {
   const label = /^(srt|json|html|css|js)$/i.test(lang) ? lang.toUpperCase() : "Промпт";
-  return `<div class="code"><div class="code-head"><span>${esc(label)}</span>
-    <button type="button" data-copy-code>${icon("copy", "sm")}Копировать</button></div><pre>${esc(code)}</pre></div>`;
+  const toVideo = label === "Промпт" && canMakeVideo() && code.length > 40
+    ? `<button type="button" data-code-video>${icon("play", "sm")}Видео</button>` : "";
+  return `<div class="code"><div class="code-head"><span>${esc(label)}</span><div class="code-actions">${toVideo}
+    <button type="button" data-copy-code>${icon("copy", "sm")}Копировать</button></div></div><pre>${esc(code)}</pre></div>`;
 }
 
 function markdown(src) {
@@ -279,23 +351,23 @@ function markdown(src) {
 // ================= Навигация =================
 
 function setTab(tab) {
-  if (S.busy) return;
   S.tab = tab;
   S.tool = null;
   S.historyItem = null;
+  S.characterItem = null;
   render();
 }
 
 function goBack() {
-  if (S.busy) { toast("Дождитесь окончания генерации", "info"); return; }
   S.tool = null;
   S.historyItem = null;
+  S.characterItem = null;
   render();
 }
 
 function render() {
   window.scrollTo(0, 0);
-  const inner = Boolean(S.tool || S.historyItem);
+  const inner = Boolean(S.tool || S.historyItem || S.characterItem);
   if (tg && tg.BackButton) inner ? tg.BackButton.show() : tg.BackButton.hide();
   $tabbar.classList.toggle("hidden", Boolean(S.tool));
   $tabbar.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.tab === S.tab));
@@ -308,6 +380,8 @@ function render() {
 
   if (S.tool) return renderTool(S.tool);
   if (S.historyItem) return renderHistoryItem(S.historyItem);
+  if (S.characterItem) return renderCharacterItem(S.characterItem);
+  if (S.tab === "characters") return renderCharacters();
   if (S.tab === "history") return renderHistory();
   if (S.tab === "settings") return renderSettings();
   return renderHome();
@@ -404,16 +478,21 @@ function renderHome() {
 
 // ================= Экран инструмента =================
 
-function openTool(tool) {
+function openTool(tool, prefill = {}) {
   S.tool = tool;
   S.values = {};
   S.files = {};
+  S.jobId = "";
+  S.busy = false;
   S.provider = defaultProvider();
+  S.characterId = prefill.characterId || "";
   for (const f of tool.fields) {
     if (f.type === "checkbox") S.values[f.name] = f.default ? "1" : "0";
     else if (f.default !== undefined && f.default !== null) S.values[f.name] = String(f.default);
     else S.values[f.name] = "";
   }
+  Object.assign(S.values, prefill.values || {});
+  Object.assign(S.files, prefill.files || {});
   render();
 }
 
@@ -503,7 +582,8 @@ function renderTool(tool) {
   const p = providers();
   const missing = tool.needs.filter((n) => !p[n]);
   const cat = CATS[tool.category] || CATS.scripts;
-  const providerField = tool.uses_llm ? `<div class="field"><div class="lbl"><span>Модель</span></div>
+  const llmLabel = tool.fields.some((f) => f.name === "enhance") ? "ИИ для улучшения промпта" : "Модель";
+  const providerField = tool.uses_llm ? `<div class="field"><div class="lbl"><span>${llmLabel}</span></div>
     <div class="segmented" id="providerSeg">${PROVIDERS.map(([id, label]) =>
       `<button type="button" data-p="${id}" class="${id === S.provider ? "on" : ""}" ${p[id] ? "" : "disabled"}>${label}</button>`).join("")}</div></div>` : "";
 
@@ -513,7 +593,8 @@ function renderTool(tool) {
     <div class="hero">${tileIcon(tool, "lg")}<div><h1>${esc(tool.title)}</h1><p>${esc(tool.subtitle)}</p></div></div>
     ${missing.length ? `<div class="notice danger">${icon("alert")}<div>Нужен ключ ${missing.map((n) => SERVICE_NAMES[n]).join(", ")}. Добавьте его в переменные сервера.</div></div>` : ""}
     ${tool.hint ? `<div class="notice">${icon("info")}<div>${esc(tool.hint)}</div></div>` : ""}
-    <form class="form" id="form" novalidate>${providerField}${tool.fields.map(fieldHTML).join("")}</form>
+    <form class="form" id="form" novalidate>${providerField}${tool.character ? `<div class="field"><div class="lbl"><span>Персонаж</span><small>из библиотеки</small></div>
+      <button type="button" class="picker char-picker" id="charPick"><span>Без персонажа</span>${icon("down", "sm")}</button></div>` : ""}${tool.fields.map(fieldHTML).join("")}</form>
     <div class="result" id="result"></div>`;
 
   $cta.innerHTML = `<div class="cta-bar"><div class="inner">
@@ -580,7 +661,29 @@ function renderTool(tool) {
 
   const voiceBtn = $view.querySelector("[data-voice]");
   if (voiceBtn) setupVoicePicker(voiceBtn);
+  const charBtn = $view.querySelector("#charPick");
+  if (charBtn) setupCharacterPicker(charBtn);
+  tool.fields.filter((f) => f.type === "file").forEach((f) => renderFiles(f.name));
   refreshVisibility();
+}
+
+async function setupCharacterPicker(btn) {
+  const list = await characters();
+  const label = btn.querySelector("span");
+  const show = () => {
+    const c = list.find((x) => x.id === S.characterId);
+    label.innerHTML = c ? `<span class="char-chip"><img src="${URL.createObjectURL(c.photos[0])}" alt="">${esc(c.name)}</span>` : (list.length ? "Без персонажа" : "Библиотека пуста");
+  };
+  show();
+  btn.onclick = () => {
+    if (!list.length) { toast("Сначала создайте персонажа в разделе «Карточка персонажа»", "info"); return; }
+    openSheet({
+      title: "Персонаж",
+      value: S.characterId,
+      options: [{ value: "", label: "Без персонажа" }, ...list.map((c) => ({ value: c.id, label: c.name, sub: (c.prompt || "").slice(0, 70) }))],
+      onPick: (v) => { S.characterId = v; show(); },
+    });
+  };
 }
 
 async function setupVoicePicker(btn) {
@@ -606,30 +709,88 @@ async function setupVoicePicker(btn) {
   });
 }
 
-function setRunning(running, started) {
+function setRunning(running, started, long) {
   const btn = $cta.querySelector("#run");
-  if (!btn) return;
   clearInterval(setRunning.timer);
+  if (!btn) return;
   btn.disabled = running;
   if (!running) {
     btn.innerHTML = `${icon("refresh")}<span>Сгенерировать ещё раз</span>`;
     return;
   }
+  const texts = long ? STATUS_LONG : STATUS_TEXT;
   const tick = () => {
     const sec = Math.round((Date.now() - started) / 1000);
-    btn.innerHTML = `<span class="spinner"></span><span>Генерация · ${sec} с</span><i class="progress"></i>`;
+    const shown = sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}` : `${sec} с`;
+    btn.innerHTML = `<span class="spinner"></span><span>Генерация · ${shown}</span><i class="progress"></i>`;
     const line = $view.querySelector("#statusText");
-    if (line) line.textContent = STATUS_TEXT[Math.min(STATUS_TEXT.length - 1, Math.floor(sec / 6))];
+    if (line) line.textContent = texts[Math.min(texts.length - 1, Math.floor(sec / (long ? 25 : 6)))];
   };
   tick();
   setRunning.timer = setInterval(tick, 1000);
 }
 
-function skeletonHTML() {
+function skeletonHTML(long) {
   const widths = [92, 78, 85, 60, 88, 70, 45];
-  return `<div class="result-body"><div class="status-line"><span class="spinner"></span><span id="statusText">${STATUS_TEXT[0]}</span></div>
+  return `<div class="result-body"><div class="status-line"><span class="spinner"></span><span id="statusText">${(long ? STATUS_LONG : STATUS_TEXT)[0]}</span></div>
     <div class="skeleton">${widths.map((w) => `<i style="width:${w}%"></i>`).join("")}</div></div>
-    <div class="foot-note">${icon("info", "sm")}Можно свернуть приложение — результат придёт в чат.</div>`;
+    <div class="foot-note">${icon("info", "sm")}Можно закрыть приложение — результат сохранится в истории и придёт в чат.</div>`;
+}
+
+// ---------- фоновые задачи ----------
+
+function pending() { return load("pending", []); }
+function setPending(list) { save("pending", list); }
+
+async function waitJob(jobId) {
+  for (;;) {
+    let j;
+    try {
+      j = await api(`/api/jobs/${jobId}`);
+    } catch (e) {
+      if (/не найдена|404/.test(e.message)) throw e;
+      await new Promise((r) => setTimeout(r, 4000));  // сеть пропала — пробуем ещё
+      continue;
+    }
+    if (j.status === "done") return j.result;
+    if (j.status === "error") throw new Error(j.error);
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
+/** Ждёт задачу, сохраняет в историю и, если раздел ещё открыт, показывает результат. */
+async function trackJob(jobId, tool, model, started) {
+  setPending(pending().concat([{ job: jobId, tool: tool.id, model, ts: started }]));
+  try {
+    const res = await waitJob(jobId);
+    const item = addHistory(tool, res, model, jobId);
+    if (S.tool === tool && S.jobId === jobId) {
+      showResult(res, item, Math.round((Date.now() - started) / 1000));
+      haptic("success");
+    } else {
+      toast(`Готово: ${tool.title}`);
+    }
+    return res;
+  } catch (e) {
+    if (S.tool === tool && S.jobId === jobId) {
+      $view.querySelector("#result").innerHTML = `<div class="error-box">${icon("alert")}<div>${esc(e.message)}</div></div>`;
+    } else {
+      toast(`${tool.title}: ошибка`, "alert");
+    }
+    haptic("error");
+  } finally {
+    setPending(pending().filter((p) => p.job !== jobId));
+    if (S.tool === tool && S.jobId === jobId) {
+      S.busy = false;
+      setRunning(false);
+    }
+  }
+}
+
+function resumePending() {
+  const list = pending().filter((p) => Date.now() - p.ts < 3 * 3600 * 1000);
+  setPending([]);
+  for (const p of list) trackJob(p.job, toolById(p.tool), p.model, p.ts);
 }
 
 async function submit() {
@@ -658,33 +819,44 @@ async function submit() {
   fd.append("_provider", S.provider);
   fd.append("_lang", S.settings.lang);
   fd.append("_to_chat", S.settings.toChat ? "1" : "0");
+  const ch = tool.character && S.characterId ? (await characters()).find((c) => c.id === S.characterId) : null;
+  if (ch) {
+    fd.append("_character", ch.prompt || ch.name);
+    ch.photos.slice(0, 3).forEach((b, i) => fd.append("_character_photos", b, `character${i}.jpg`));
+  }
 
+  const long = LONG_TOOLS.includes(tool.id) && (tool.id !== "voices" || S.values.mode === "dub");
   const started = Date.now();
   S.busy = true;
-  box.innerHTML = skeletonHTML();
+  box.innerHTML = skeletonHTML(long);
   box.scrollIntoView({ behavior: "smooth", block: "start" });
-  setRunning(true, started);
+  setRunning(true, started, long);
   haptic("medium");
 
   try {
-    const res = await api(`/api/run/${tool.id}`, { method: "POST", body: fd });
-    if (tool.id === "voices" && S.values.mode === "clone") S.voices = null;
-    const item = addHistory(tool, res, tool.uses_llm ? providerName(S.provider) : "");
-    if (S.tool !== tool) return;
-    const secs = Math.round((Date.now() - started) / 1000);
-    box.innerHTML = resultHTML(res, { meta: `за ${secs} с${item.model ? " · " + item.model : ""}`, rerun: true });
-    bindResult(box, res.text, tool.title);
-    haptic("success");
+    const { job } = await api(`/api/run/${tool.id}`, { method: "POST", body: fd });
+    S.jobId = job;
+    trackJob(job, tool, tool.uses_llm ? providerName(S.provider) : "", started);
   } catch (e) {
-    if (S.tool === tool) box.innerHTML = `<div class="error-box">${icon("alert")}<div>${esc(e.message)}</div></div>`;
-    haptic("error");
-  } finally {
     S.busy = false;
-    if (S.tool === tool) setRunning(false);
+    setRunning(false);
+    box.innerHTML = `<div class="error-box">${icon("alert")}<div>${esc(e.message)}</div></div>`;
+    haptic("error");
   }
 }
 
-function resultHTML(res, { meta = "", rerun = false } = {}) {
+function showResult(res, item, secs) {
+  const box = $view.querySelector("#result");
+  if (!box) return;
+  S.lastText = res.text || "";
+  const meta = [secs !== undefined ? `за ${secs} с` : "", item && item.model].filter(Boolean).join(" · ");
+  box.innerHTML = resultHTML(res, { meta, rerun: Boolean(S.tool), job: item && item.job });
+  bindResult(box, res, S.tool ? S.tool.title : (item && item.title) || "Результат", item);
+}
+
+function canMakeVideo() { const p = providers(); return p.gemini || p.openai; }
+
+function resultHTML(res, { meta = "", rerun = false, job = "" } = {}) {
   const imgs = res.images || [];
   const hasMedia = imgs.length || res.audio || res.video;
   let body = "";
@@ -697,6 +869,20 @@ function resultHTML(res, { meta = "", rerun = false } = {}) {
   if (res.audio) body += `<audio class="player" src="${res.audio}" controls></audio>`;
   if (res.text) body += `<div class="md">${markdown(res.text)}</div>`;
 
+  const follow = (res.followups || []).filter((f) => S.cfg.tools.some((t) => t.id === f.tool));
+  const nextSteps = follow.length || res.character ? `<div class="next">
+      <div class="next-title">Дальше</div>
+      ${res.character ? `<button class="next-btn" data-save-char>${icon("bookmark")}<span>Сохранить персонажа в библиотеку</span>${icon("arrow", "sm")}</button>` : ""}
+      ${follow.map((f, i) => `<button class="next-btn" data-follow="${i}">${icon(f.tool === "video_gen" ? "play" : "mic")}<span>${esc(f.label)}</span>${icon("arrow", "sm")}</button>`).join("")}
+    </div>` : "";
+
+  const refineBox = res.refinable && job ? `<div class="refine">
+      <div class="next-title">${icon("wand", "sm")}Доработать результат</div>
+      <div class="refine-chips">${REFINE_CHIPS.map((c) => `<button class="chip" data-chip="${esc(c)}">${esc(c)}</button>`).join("")}</div>
+      <div class="refine-row"><textarea class="textarea" id="refineText" rows="2" placeholder="Например: сделай героиню старше, добавь юмор"></textarea>
+      <button class="icon-btn accent" id="refineGo" aria-label="Доработать">${icon("send")}</button></div>
+    </div>` : "";
+
   const actions = [];
   if (res.text) actions.push(`<button class="tool-btn" data-act="copy">${icon("copy", "sm")}Копировать</button>`);
   if (res.text) actions.push(`<button class="tool-btn" data-act="send">${icon("send", "sm")}В чат</button>`);
@@ -705,12 +891,35 @@ function resultHTML(res, { meta = "", rerun = false } = {}) {
   return `<div class="result-head"><h3>${icon("checkCircle")}Готово</h3><small>${esc(meta)}</small></div>
     <div class="result-body">${body}</div>
     ${actions.length ? `<div class="toolbar" style="grid-template-columns:repeat(${actions.length},1fr)">${actions.join("")}</div>` : ""}
-    ${hasMedia ? `<div class="foot-note">${icon("chat", "sm")}Файлы также отправлены в чат с ботом.</div>` : ""}`;
+    ${hasMedia ? `<div class="foot-note">${icon("chat", "sm")}Файлы также отправлены в чат с ботом.</div>` : ""}
+    ${nextSteps}${refineBox}`;
 }
 
-function bindResult(box, text, title) {
+async function followup(f) {
+  const target = toolById(f.tool);
+  const files = {};
+  try {
+    for (const [field, src] of Object.entries(f.files || {})) {
+      if (src.url) files[field] = [await urlToFile(src.url, `${field}.png`)];
+      else if (src.from_field && S.files[src.from_field]) files[field] = S.files[src.from_field].slice();
+    }
+  } catch {
+    toast("Файл уже недоступен — загрузите его вручную", "alert");
+  }
+  haptic();
+  openTool(target, { values: f.values || {}, files, characterId: S.characterId });
+}
+
+function bindResult(box, res, title, item) {
+  const text = res.text || "";
   box.querySelectorAll("[data-copy-code]").forEach((b) => {
     b.onclick = () => copy(b.closest(".code").querySelector("pre").textContent);
+  });
+  box.querySelectorAll("[data-code-video]").forEach((b) => {
+    b.onclick = () => {
+      const prompt = b.closest(".code").querySelector("pre").textContent;
+      openTool(toolById("video_gen"), { values: { prompt, enhance: "0" }, characterId: S.characterId });
+    };
   });
   box.querySelectorAll("[data-open]").forEach((a) => {
     a.onclick = (e) => {
@@ -729,11 +938,78 @@ function bindResult(box, text, title) {
       toast("Отправлено в чат", "send");
     } catch (e) { toast(e.message, "alert"); }
   });
+
+  const follow = (res.followups || []).filter((f) => S.cfg.tools.some((t) => t.id === f.tool));
+  box.querySelectorAll("[data-follow]").forEach((b) => { b.onclick = () => followup(follow[+b.dataset.follow]); });
+
+  const saveBtn = box.querySelector("[data-save-char]");
+  if (saveBtn) saveBtn.onclick = () => saveCharacter(res, saveBtn);
+
+  const go = box.querySelector("#refineGo");
+  if (go) {
+    const input = box.querySelector("#refineText");
+    box.querySelectorAll("[data-chip]").forEach((c) => {
+      c.onclick = () => { input.value = c.dataset.chip; haptic("select"); };
+    });
+    go.onclick = () => doRefine(item, input.value.trim());
+  }
+}
+
+async function doRefine(item, instruction) {
+  if (!instruction) { toast("Напишите, что изменить", "info"); return; }
+  if (S.busy) return;
+  const tool = S.tool || toolById(item.tool);
+  const box = $view.querySelector("#result");
+  const started = Date.now();
+  S.busy = true;
+  box.innerHTML = skeletonHTML(false);
+  box.scrollIntoView({ behavior: "smooth", block: "start" });
+  setRunning(true, started, false);
+  try {
+    const { job } = await api("/api/refine", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job: item.job, text: S.lastText || item.text, instruction, to_chat: S.settings.toChat }),
+    });
+    S.jobId = job;
+    const res = await waitJob(job);
+    const next = addHistory(tool, res, item.model, job);
+    S.busy = false;
+    if (S.jobId === job) showResult(res, next, Math.round((Date.now() - started) / 1000));
+    haptic("success");
+  } catch (e) {
+    S.busy = false;
+    box.innerHTML = `<div class="error-box">${icon("alert")}<div>${esc(e.message)}</div></div>`;
+    haptic("error");
+  } finally {
+    setRunning(false);
+  }
+}
+
+async function saveCharacter(res, btn) {
+  try {
+    const photos = await Promise.all((S.files.photos || []).map((f) => downscale(f)));
+    let sheet = null;
+    if ((res.images || [])[0]) sheet = await downscale(await (await fetch(res.images[0])).blob(), 1600);
+    if (!photos.length && sheet) photos.push(sheet);
+    if (!photos.length) { toast("Нет фото персонажа", "alert"); return; }
+    const name = (res.character && res.character.name) || S.values.name || `Персонаж ${new Date().toLocaleDateString("ru-RU")}`;
+    await CharDB.put({
+      id: String(Date.now()), ts: Date.now(), name, prompt: (res.character && res.character.prompt) || "",
+      description: res.text || "", photos, sheet,
+    });
+    S.characters = null;
+    btn.disabled = true;
+    btn.querySelector("span").textContent = "Сохранено в библиотеку";
+    haptic("success");
+    toast("Персонаж сохранён", "bookmark");
+  } catch (e) {
+    toast(`Не удалось сохранить: ${e.message}`, "alert");
+  }
 }
 
 // ================= История =================
 
-function addHistory(tool, res, model) {
+function addHistory(tool, res, model, job) {
   const items = load("history", []);
   const item = {
     id: Date.now(),
@@ -741,6 +1017,8 @@ function addHistory(tool, res, model) {
     title: tool.title,
     ts: Date.now(),
     model,
+    job,
+    refinable: Boolean(res.refinable),
     text: (res.text || "").slice(0, 40000),
     media: (res.images || []).length + (res.audio ? 1 : 0) + (res.video ? 1 : 0),
   };
@@ -790,9 +1068,68 @@ function renderHistoryItem(it) {
   $view.innerHTML = `
     <div class="topbar"><button class="icon-btn" id="back" aria-label="Назад">${icon("back")}</button><div class="title muted">История</div></div>
     <div class="hero">${tileIcon(t, "lg")}<div><h1>${esc(it.title)}</h1><p>${esc(meta)}</p></div></div>
-    <div id="result">${resultHTML({ text: it.text || "Медиафайлы были отправлены в чат с ботом." })}</div>`;
+    <div id="result"></div>`;
   $view.querySelector("#back").onclick = goBack;
-  bindResult($view.querySelector("#result"), it.text, it.title);
+  const res = { text: it.text || "Медиафайлы были отправлены в чат с ботом.", refinable: it.refinable };
+  const box = $view.querySelector("#result");
+  S.lastText = it.text || "";
+  box.innerHTML = resultHTML(res, { job: it.job });
+  bindResult(box, res, it.title, it);
+}
+
+// ================= Персонажи =================
+
+async function renderCharacters() {
+  $view.innerHTML = `<div class="page-title">Персонажи</div><div class="boot"><span class="spinner"></span></div>`;
+  const list = await characters();
+  if (S.tab !== "characters" || S.tool || S.characterItem) return;
+  const create = `<button class="next-btn create" id="newChar">${icon("plus")}<span>Создать персонажа из фото</span>${icon("arrow", "sm")}</button>`;
+  if (!list.length) {
+    $view.innerHTML = `<div class="page-title">Персонажи</div>
+      <div class="empty"><div class="tile-ic lg">${icon("users")}</div>Сохраняйте героев, чтобы их внешность не менялась<br>от видео к видео. Персонаж подставляется в промпты,<br>картинки и генерацию видео.</div>${create}`;
+  } else {
+    $view.innerHTML = `<div class="page-title">Персонажи</div>${create}
+      <div class="char-grid">${list.map((c) => `<button class="char-card" data-char="${c.id}">
+        <img src="${URL.createObjectURL(c.sheet || c.photos[0])}" alt="">
+        <div><b>${esc(c.name)}</b><small>${esc((c.prompt || "").slice(0, 60))}</small></div></button>`).join("")}</div>
+      <p class="muted" style="font-size:12.5px;margin:14px 4px 0">Библиотека хранится на этом устройстве.</p>`;
+  }
+  $view.querySelector("#newChar").onclick = () => openTool(toolById("character"));
+  $view.querySelectorAll("[data-char]").forEach((el) => {
+    el.onclick = () => { S.characterItem = list.find((c) => c.id === el.dataset.char); render(); };
+  });
+}
+
+function renderCharacterItem(c) {
+  const photos = [c.sheet, ...c.photos].filter(Boolean).map((b) => URL.createObjectURL(b));
+  const uses = ["video_gen", "seedance", "serial", "image"].map(toolById).filter((t) => t.title);
+  $view.innerHTML = `
+    <div class="topbar"><button class="icon-btn" id="back" aria-label="Назад">${icon("back")}</button><div class="title muted">Персонаж</div></div>
+    <div class="char-photos">${photos.map((u) => `<img src="${u}" alt="">`).join("")}</div>
+    <h1 class="char-name">${esc(c.name)}</h1>
+    ${c.prompt ? codeBlock(c.prompt, "") : ""}
+    <div class="next"><div class="next-title">Использовать в разделе</div>
+      ${uses.map((t) => `<button class="next-btn" data-use="${t.id}">${icon(t.icon)}<span>${esc(t.title)}</span>${icon("arrow", "sm")}</button>`).join("")}
+    </div>
+    ${c.description ? `<div class="group-label">Описание</div><div class="result-body"><div class="md">${markdown(c.description)}</div></div>` : ""}
+    <div class="group-label">Управление</div>
+    <div class="list"><button class="list-row danger" id="delChar">${icon("trash", "sm")}Удалить персонажа</button></div>`;
+  $view.querySelector("#back").onclick = goBack;
+  $view.querySelectorAll("[data-copy-code]").forEach((b) => { b.onclick = () => copy(c.prompt); });
+  $view.querySelectorAll("[data-code-video]").forEach((b) => b.remove());
+  $view.querySelectorAll("[data-use]").forEach((b) => {
+    b.onclick = () => { S.characterItem = null; openTool(toolById(b.dataset.use), { characterId: c.id }); };
+  });
+  $view.querySelector("#delChar").onclick = () => {
+    const doDelete = async () => {
+      await CharDB.del(c.id);
+      S.characters = null;
+      toast("Персонаж удалён", "trash");
+      goBack();
+    };
+    if (tg && tg.showConfirm && tg.initData) tg.showConfirm(`Удалить «${c.name}»?`, (ok) => ok && doDelete());
+    else if (confirm(`Удалить «${c.name}»?`)) doDelete();
+  };
 }
 
 // ================= Настройки =================
@@ -878,6 +1215,7 @@ async function init() {
   try {
     S.cfg = await api("/api/config");
     render();
+    resumePending();
   } catch (e) {
     $tabbar.classList.add("hidden");
     $view.innerHTML = `<div class="empty"><div class="tile-ic lg">${icon("alert")}</div>${esc(e.message)}</div>`;

@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from . import config
-from .ai import images, llm, voice
+from .ai import images, llm, media, video, voice
 from .ai.llm import AIError, Media
 
 log = logging.getLogger(__name__)
@@ -20,6 +20,9 @@ class RunContext:
     files: dict[str, list[Media]]
     provider: str
     lang: str
+    character: str = ""  # промпт персонажа из библиотеки
+    character_media: list[Media] = field(default_factory=list)
+    refine: dict | None = None  # контекст для «Доработать»: system, prompt, provider
 
     def v(self, name: str, default: str = "") -> str:
         return self.values.get(name, "").strip() or default
@@ -37,6 +40,9 @@ class Result:
     images: list[bytes] = field(default_factory=list)
     audio: bytes | None = None
     video: bytes | None = None
+    # Кнопки перехода в другие разделы: {label, tool, values, files: {поле: {"image": i} | {"from_field": имя}}}
+    followups: list[dict] = field(default_factory=list)
+    character: dict | None = None  # данные для сохранения персонажа в библиотеку
 
 
 @dataclass
@@ -53,12 +59,13 @@ class Tool:
     uses_llm: bool = True  # показывать выбор модели (Claude / ChatGPT / Gemini)
     needs: tuple[str, ...] = ()  # обязательные ключи API
     hint: str = ""
+    character: bool = False  # можно подставить персонажа из библиотеки
 
     def public(self) -> dict:
         return {
             "id": self.id, "title": self.title, "subtitle": self.subtitle, "icon": self.icon,
             "category": self.category, "fields": self.fields, "uses_llm": self.uses_llm,
-            "needs": self.needs, "hint": self.hint,
+            "needs": self.needs, "hint": self.hint, "character": self.character,
         }
 
 
@@ -95,6 +102,13 @@ def check(name, label, default=False, **kw):
 ASPECTS = [("9:16", "9:16"), ("16:9", "16:9"), ("1:1", "1:1")]
 OUT_LANGS = [("русский", "Русский"), ("узбекский", "Узбекский"), ("английский", "Английский"),
              ("казахский", "Казахский"), ("турецкий", "Турецкий")]
+
+# Языки дубляжа ElevenLabs (если язык не поддерживается — ElevenLabs вернёт ошибку)
+DUB_LANGS = [("en", "Английский"), ("ru", "Русский"), ("uz", "Узбекский"), ("kk", "Казахский"),
+             ("tr", "Турецкий"), ("uk", "Украинский"), ("ar", "Арабский"), ("de", "Немецкий"),
+             ("fr", "Французский"), ("es", "Испанский"), ("it", "Итальянский"), ("pt", "Португальский"),
+             ("pl", "Польский"), ("hi", "Хинди"), ("zh", "Китайский"), ("ja", "Японский"),
+             ("ko", "Корейский"), ("id", "Индонезийский")]
 
 # ---------- общие промпты ----------
 
@@ -145,21 +159,58 @@ class _Defaults(dict):
 def build_prompt(tool: Tool, ctx: RunContext, task: str | None = None, attachments_note: str = "") -> str:
     task = (task or tool.task).format_map(_Defaults({k: ctx.v(k) for k in ctx.values}))
     parts = [task, "Данные от пользователя:\n" + (user_data(tool, ctx) or "- (не указаны)")]
+    if ctx.character:
+        parts.append(character_block(ctx))
     if attachments_note:
         parts.append(attachments_note)
     return "\n\n".join(parts)
 
 
+def character_block(ctx: RunContext) -> str:
+    return (
+        "Главный персонаж из библиотеки пользователя. Используй это описание дословно (на английском) "
+        "в каждом промпте, где он появляется, чтобы внешность не менялась"
+        + (" — его фото тоже приложены" if ctx.character_media else "")
+        + f":\n{ctx.character}"
+    )
+
+
 def all_media(tool: Tool, ctx: RunContext) -> list[Media]:
-    return [m for f in tool.fields if f["type"] == "file" for m in ctx.f(f["name"])]
+    own = [m for f in tool.fields if f["type"] == "file" for m in ctx.f(f["name"])]
+    return own + ctx.character_media
+
+
+async def ask(ctx: RunContext, system: str, prompt: str, media: list[Media] | None = None,
+              provider: str | None = None) -> str:
+    """Запрос к текстовой модели с сохранением контекста для кнопки «Доработать»."""
+    provider = provider or ctx.provider
+    answer = await llm.generate_text(provider, system, prompt, media)
+    ctx.refine = {"system": system, "prompt": prompt, "provider": provider}
+    return answer
 
 
 async def run_text(tool: Tool, ctx: RunContext) -> Result:
     media = all_media(tool, ctx)
     note = "К сообщению приложены файлы пользователя — внимательно изучи их." if media else ""
     system = f"{PRODUCER}\n\n{tool.system}\n\n{lang_rule(ctx.lang)}".strip()
-    answer = await llm.generate_text(ctx.provider, system, build_prompt(tool, ctx, attachments_note=note), media)
-    return Result(text=answer)
+    return Result(text=await ask(ctx, system, build_prompt(tool, ctx, attachments_note=note), media))
+
+
+REFINE_TASK = (
+    "Ниже — исходная задача пользователя и твой предыдущий ответ. Доработай ответ по новой просьбе. "
+    "Верни ПОЛНЫЙ обновлённый результат целиком в том же формате — без вступлений и без пересказа изменений."
+)
+
+
+async def refine(context: dict, previous: str, instruction: str) -> str:
+    prompt = (
+        f"{REFINE_TASK}\n\n## Исходная задача\n{context['prompt']}\n\n"
+        f"## Предыдущий ответ\n{previous}\n\n## Что изменить\n{instruction}"
+    )
+    provider = context["provider"]
+    if not config.available_providers().get(provider):
+        provider = next(p for p in ("claude", "openai", "gemini") if config.available_providers()[p])
+    return await llm.generate_text(provider, context["system"], prompt)
 
 
 def extract_json(raw: str) -> dict:
@@ -234,16 +285,62 @@ VIDEO_STUDY_TASKS = {
 }
 
 
+ANIM_MARK = "ANIMATION_PROMPT:"
+LANG_CODES = {"русский": "ru", "узбекский": "uz", "английский": "en", "казахский": "kk", "турецкий": "tr"}
+
+
 async def run_video_study(tool: Tool, ctx: RunContext) -> Result:
-    task = VIDEO_STUDY_TASKS.get(ctx.v("mode"), VIDEO_STUDY_TASKS["full"])
+    mode = ctx.v("mode", "full")
+    task = VIDEO_STUDY_TASKS.get(mode, VIDEO_STUDY_TASKS["full"])
+    if mode == "replace":
+        task += (
+            f"\n\nВ самом конце ответа отдельной строкой выведи «{ANIM_MARK} <промпт на английском для "
+            "image-to-video: действие и движение героя и камеры на протяжении всего ролика, без описания внешности>»."
+        )
     system = f"{PRODUCER}\n\nТы внимательно анализируешь видео, точно расставляешь таймкоды.\n\n{lang_rule(ctx.lang)}"
-    note = "Первый файл — видео. Если есть изображение — это фото нового персонажа."
-    answer = await llm.generate_text("gemini", system, build_prompt(tool, ctx, task, note), all_media(tool, ctx))
-    return Result(text=answer)
+    note = "Первый файл — видео. Изображения (если есть) — фото нового персонажа."
+    answer = await ask(ctx, system, build_prompt(tool, ctx, task, note), all_media(tool, ctx), provider="gemini")
+
+    anim = ""
+    found = re.search(rf"{ANIM_MARK}\s*(.+)", answer)
+    if found:
+        anim = found.group(1).strip().strip("`*« »")
+        answer = answer[: found.start()].rstrip(" *\n")
+    result = Result(text=answer)
+    providers = config.available_providers()
+
+    photos = ctx.f("character_photo") + ctx.character_media
+    if mode == "replace" and photos and (providers["gemini"] or providers["openai"]):
+        try:
+            frame = await media.extract_frame(ctx.f("video")[0])
+            instruction = (
+                "Replace the main person in the first image with the person shown in the other reference image(s). "
+                "Keep exactly the same pose, framing, camera angle, background and lighting. Photorealistic, seamless."
+                + (f" New character details: {ctx.v('new_character')}" if ctx.v("new_character") else "")
+            )
+            result.images = (await images.generate_image(image_engine(), instruction, [frame, *photos[:3]], "auto"))[:1]
+            result.text += "\n\n## Первый кадр с новым персонажем\nНиже — готовый стартовый кадр. Его можно сразу оживить в видео."
+            result.followups.append({
+                "label": "Оживить кадр в видео", "tool": "video_gen",
+                "values": {"prompt": anim, "enhance": "0" if anim else "1"}, "files": {"image": {"image": 0}},
+            })
+        except Exception as e:
+            log.warning("character swap failed: %s", e)
+            result.text += f"\n\n⚠️ Не удалось заменить персонажа на первом кадре: {e}"
+
+    if mode in ("translate", "full") and providers["elevenlabs"]:
+        result.followups.append({
+            "label": "Сделать дубляж (ElevenLabs)", "tool": "voices",
+            "values": {"mode": "dub", "target_lang": LANG_CODES.get(ctx.v("target_lang"), "en")},
+            "files": {"source": {"from_field": "video"}},
+        })
+    return result
 
 
 async def run_image(tool: Tool, ctx: RunContext) -> Result:
-    prompt, refs = ctx.v("prompt"), ctx.f("refs")
+    prompt, refs = ctx.v("prompt"), (ctx.f("refs") + ctx.character_media)[:4]
+    if ctx.character:
+        prompt += f"\n\nCharacter (keep appearance exactly): {ctx.character}"
     note = ""
     if ctx.flag("enhance"):
         system = (
@@ -260,7 +357,13 @@ async def run_image(tool: Tool, ctx: RunContext) -> Result:
     imgs, failed = await gather_images(tasks)
     if failed:
         note += f"\n\n⚠️ Не удалось сгенерировать {failed} из {len(tasks)}."
-    return Result(text=note.strip(), images=imgs)
+    result = Result(text=note.strip(), images=imgs)
+    for i in range(len(imgs)):
+        result.followups.append({
+            "label": f"Оживить вариант {i + 1}" if len(imgs) > 1 else "Оживить в видео",
+            "tool": "video_gen", "values": {"enhance": "1"}, "files": {"image": {"image": i}},
+        })
+    return result
 
 
 async def run_motion(tool: Tool, ctx: RunContext) -> Result:
@@ -300,26 +403,35 @@ async def run_angles(tool: Tool, ctx: RunContext) -> Result:
             f"\n**Промпт для анимации:**\n```\n{a.get('video_prompt', '')}\n```"
         )
 
-    imgs: list[bytes] = []
+    result = Result()
     if ctx.flag("generate") and angles:
         engine = image_engine()
-        tasks = [
+        size = {"9:16": "1024x1536", "16:9": "1536x1024"}.get(ctx.v("aspect"), "1024x1024")
+        outcomes = await asyncio.gather(*[
             images.generate_image(
                 engine,
                 "Using the reference image, show the exact same scene, characters, clothing, environment, "
                 f"lighting and style from a different camera angle: {a.get('image_prompt', '')}",
-                frame,
-                "1024x1536" if ctx.v("aspect") == "9:16" else "1536x1024" if ctx.v("aspect") == "16:9" else "1024x1024",
+                frame, size,
             )
             for a in angles
-        ]
-        try:
-            imgs, failed = await gather_images(tasks)
-            if failed:
-                md.append(f"⚠️ Не удалось сгенерировать {failed} изображ. из {len(tasks)}.")
-        except Exception as e:  # промпты всё равно полезны — отдаём их
-            md.append(f"⚠️ Изображения не сгенерировались: {e}")
-    return Result(text="\n\n".join(md), images=imgs)
+        ], return_exceptions=True)
+        errors = [o for o in outcomes if isinstance(o, BaseException)]
+        for a, out in zip(angles, outcomes):
+            if isinstance(out, BaseException) or not out:
+                continue
+            result.images.append(out[0])
+            result.followups.append({
+                "label": f"Оживить: {a.get('name', 'ракурс')}", "tool": "video_gen",
+                "values": {"prompt": a.get("video_prompt", ""), "enhance": "0",
+                           "aspect": "16:9" if ctx.v("aspect") == "16:9" else "9:16"},
+                "files": {"image": {"image": len(result.images) - 1}},
+            })
+        if errors:
+            log.warning("angle images failed: %r", errors[0])
+            md.append(f"⚠️ Не удалось сгенерировать {len(errors)} из {len(angles)} изображений: {errors[0]}")
+    result.text = "\n\n".join(md)
+    return result
 
 
 async def run_voices(tool: Tool, ctx: RunContext) -> Result:
@@ -338,6 +450,17 @@ async def run_voices(tool: Tool, ctx: RunContext) -> Result:
         if src[0].is_video and ctx.flag("keep_video"):
             return Result(video=await voice.replace_audio(src[0], new_audio), audio=new_audio)
         return Result(audio=new_audio)
+
+    if mode == "dub":
+        src = ctx.f("source")
+        if not src:
+            raise AIError("Загрузите видео или аудио для дубляжа.")
+        data, mime = await voice.dub(src[0], ctx.v("target_lang", "en"))
+        lang = dict(DUB_LANGS).get(ctx.v("target_lang"), ctx.v("target_lang"))
+        note = f"✅ Дубляж на язык: **{lang}**. Голоса спикеров сохранены, фоновая музыка и звуки — тоже."
+        if mime.startswith("video/"):
+            return Result(text=note, video=data)
+        return Result(text=note, audio=data)
 
     if mode == "clone":
         samples = ctx.f("samples")
@@ -381,6 +504,9 @@ async def run_character(tool: Tool, ctx: RunContext) -> Result:
     if isinstance(results[0], BaseException):
         raise results[0]
     result = Result(text=results[0])
+    ctx.refine = {"system": system, "prompt": prompt, "provider": ctx.provider}
+    found = re.search(r"Промпт персонажа[^\n]*\n+(?:[^`]*?)```[^\n]*\n(.*?)```", results[0], re.S)
+    result.character = {"name": ctx.v("name"), "prompt": found.group(1).strip() if found else ""}
     if len(results) > 1:
         if isinstance(results[1], BaseException):
             log.warning("character sheet failed: %s", results[1])
@@ -388,6 +514,32 @@ async def run_character(tool: Tool, ctx: RunContext) -> Result:
         else:
             result.images = results[1]
     return result
+
+
+VIDEO_ENHANCE = (
+    "Ты — режиссёр AI-видео. Перепиши запрос пользователя в один промпт на английском для {engine}: "
+    "кто в кадре, что происходит по секундам, движение камеры и объектив, свет, стиль и цвет, атмосфера, "
+    "звук и реплики (реплики — в кавычках, на языке пользователя). Длительность {seconds} секунд, формат {aspect}. "
+    "Если приложен первый кадр — опиши движение от него, не меняя внешность и окружение. "
+    "Верни ТОЛЬКО сам промпт, без пояснений."
+)
+
+
+async def run_video_gen(tool: Tool, ctx: RunContext) -> Result:
+    engine = ctx.v("engine", "veo")
+    llm.require("gemini" if engine == "veo" else "openai")
+    image = (ctx.f("image") or [None])[0]
+    seconds = int(ctx.v("seconds", "8"))
+    aspect = ctx.v("aspect", "9:16")
+    prompt = ctx.v("prompt") or "Bring this frame to life with natural, cinematic motion."
+    if ctx.character:
+        prompt += f"\n\nMain character (keep appearance exactly): {ctx.character}"
+    if ctx.flag("enhance"):
+        system = VIDEO_ENHANCE.format(engine="Veo" if engine == "veo" else "Sora", seconds=seconds, aspect=aspect)
+        refs = ([image] if image else []) + ctx.character_media[:2]
+        prompt = await llm.generate_text(ctx.provider, system, prompt, refs)
+    clip = await video.generate_video(engine, prompt, image, ctx.character_media, aspect, seconds)
+    return Result(text=f"**Промпт:**\n```\n{prompt}\n```", video=clip)
 
 
 # ---------- список разделов ----------
@@ -436,8 +588,9 @@ TOOLS: list[Tool] = [
             area("new_character", "Новый персонаж", "Опишите, на кого заменить (необязательно)"),
             files("character_photo", "Фото нового персонажа", "image/*"),
         ],
-        run=run_video_study, uses_llm=False, needs=("gemini",),
-        hint="Видео анализирует Gemini. Лучше загружать ролики до 2–3 минут.",
+        run=run_video_study, uses_llm=False, needs=("gemini",), character=True,
+        hint="Видео анализирует Gemini (ролики до 2–3 минут). В режиме «Замена персонажа» с фото "
+             "получите готовый первый кадр с новым героем — его можно сразу оживить в видео.",
     ),
     Tool(
         "stories", "Stories и Reels", "Мини-серии и контент-план", "phone", "scripts",
@@ -473,6 +626,7 @@ TOOLS: list[Tool] = [
             "блоком на английском. Потом — чего избегать, и 2 альтернативы: более динамичная и более "
             "атмосферная. Если приложен референс — персонаж и стиль должны с ним совпадать."
         ),
+        character=True,
     ),
     Tool(
         "minidrama", "Мини-драма", "Вертикальный сериал из 5 серий", "clapper", "scripts",
@@ -491,6 +645,7 @@ TOOLS: list[Tool] = [
             "Для каждой серии: название, сцены с таймкодами, диалоги, клиффхэнгер в конце и "
             "промпт для AI-видео на каждую сцену (8–10 секунд) с одинаковыми описаниями персонажей."
         ),
+        character=True,
     ),
     Tool(
         "serial", "Создание сериала", "Связанные 10-секундные промпты", "layers", "prompts",
@@ -509,6 +664,7 @@ TOOLS: list[Tool] = [
             "каждом промпте), **последний кадр** — его можно использовать как стартовый кадр следующей "
             "сцены, и реплика/закадровый текст. Каждая сцена продолжает предыдущую без скачков."
         ),
+        character=True,
     ),
     Tool(
         "grok", "Промпты для Grok", "Кадры, как в кино", "aperture", "prompts",
@@ -525,6 +681,7 @@ TOOLS: list[Tool] = [
             "например 35mm / anamorphic, lighting, color grade, film stock, mood) и **промпт анимации** "
             "(движение камеры и героя, ~6 секунд)."
         ),
+        character=True,
     ),
     Tool(
         "image", "GPT Image", "Картинка из текста или по референсу", "image", "visual",
@@ -537,7 +694,7 @@ TOOLS: list[Tool] = [
             select("count", "Вариантов", ["1", "2", "3", "4"]),
             check("enhance", "Улучшить промпт с помощью ИИ", True),
         ],
-        run=run_image,
+        run=run_image, character=True,
     ),
     Tool(
         "motion", "Видео-анимация", "Моушн-дизайн под каждую фразу", "sparkles", "visual",
@@ -573,14 +730,29 @@ TOOLS: list[Tool] = [
         hint="Полученные кадры можно анимировать в Seedance/Kling по промптам анимации.",
     ),
     Tool(
+        "video_gen", "Генерация видео", "Veo и Sora: из текста или кадра", "film", "media",
+        [
+            area("prompt", "Что происходит в видео", "Действие, камера, настроение. Можно по-русски"),
+            files("image", "Первый кадр", "image/*"),
+            select("engine", "Генератор", [("veo", "Veo"), ("sora", "Sora")]),
+            select("aspect", "Формат", [("9:16", "9:16"), ("16:9", "16:9")]),
+            select("seconds", "Длительность", [("4", "4 с"), ("8", "8 с"), ("12", "12 с")], "8"),
+            check("enhance", "Улучшить промпт с помощью ИИ", True),
+        ],
+        run=run_video_gen, character=True,
+        hint="Veo работает по ключу Gemini, Sora — по ключу OpenAI. Генерация занимает 1–5 минут и "
+             "оплачивается за секунду видео. Veo делает до 8 секунд. Готовое видео придёт и в чат.",
+    ),
+    Tool(
         "voices", "Голоса", "Озвучка, клон и замена голоса", "mic", "media",
         [
-            select("mode", "Режим", [("tts", "Озвучить текст"), ("sts", "Заменить голос в аудио/видео"),
-                                     ("clone", "Клонировать голос")]),
+            select("mode", "Режим", [("tts", "Озвучить текст"), ("dub", "Дубляж видео на другой язык"),
+                                     ("sts", "Заменить голос в аудио/видео"), ("clone", "Клонировать голос")]),
             {"name": "voice", "label": "Голос", "type": "voice", "required": True,
              "show_if": {"mode": ["tts", "sts"]}},
             area("text", "Текст", "Текст для озвучки", show_if={"mode": ["tts"]}),
-            files("source", "Аудио или видео с речью", "audio/*,video/*", show_if={"mode": ["sts"]}),
+            files("source", "Аудио или видео с речью", "audio/*,video/*", show_if={"mode": ["sts", "dub"]}),
+            select("target_lang", "Язык дубляжа", DUB_LANGS, show_if={"mode": ["dub"]}),
             check("keep_video", "Вернуть видео с новым голосом", True, show_if={"mode": ["sts"]}),
             text("name", "Название голоса", "Например: Мой голос", show_if={"mode": ["clone"]}),
             files("samples", "Образцы голоса", "audio/*,video/*", multiple=True, max_files=5,
@@ -590,7 +762,8 @@ TOOLS: list[Tool] = [
             check("denoise", "Убрать фоновый шум", False, show_if={"mode": ["sts", "clone"]}),
         ],
         run=run_voices, uses_llm=False, needs=("elevenlabs",),
-        hint="Работает через ElevenLabs. Клонирование доступно на платных тарифах ElevenLabs.",
+        hint="ElevenLabs. «Дубляж» переводит видео голосами самих спикеров и сохраняет музыку и фон. "
+             "«Замена голоса» фон убирает. Клонирование доступно на платных тарифах.",
     ),
     Tool(
         "character", "Карточка персонажа", "Карточка из 3 фото", "user", "visual",

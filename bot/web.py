@@ -1,9 +1,11 @@
 """HTTP-сервер: отдаёт Mini App и API для него."""
 
+import asyncio
 import logging
 import mimetypes
 import secrets
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from aiogram import Bot
@@ -13,7 +15,7 @@ from aiohttp import web
 from . import auth, config
 from .ai import voice
 from .ai.llm import AIError, Media
-from .tools import TOOLS, TOOLS_BY_ID, Result, RunContext, run_tool
+from .tools import TOOLS, TOOLS_BY_ID, Result, RunContext, refine, run_tool
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +83,82 @@ def _mime(field: web.FileField) -> str:
     return "image/jpeg" if mime == "image/jpg" else mime
 
 
+@dataclass
+class Job:
+    """Фоновая генерация: Mini App опрашивает её статус, а готовый результат дублируется в чат."""
+    id: str
+    user_id: int
+    title: str
+    created: float = field(default_factory=time.time)
+    status: str = "running"  # running | done | error
+    result: dict | None = None
+    error: str = ""
+    refine: dict | None = None  # контекст для «Доработать»
+
+
+_jobs: dict[str, Job] = {}
+_tasks: set[asyncio.Task] = set()  # держим ссылки, чтобы задачи не собрал сборщик мусора
+
+
+def serialize(result: Result, chat_note: str, refinable: bool) -> dict:
+    images = [store_media(i, "image/png") for i in result.images]
+    followups = []
+    for f in result.followups:
+        files = {}
+        for target, src in (f.get("files") or {}).items():
+            if "image" in src and src["image"] < len(images):
+                files[target] = {"url": images[src["image"]]}
+            elif "from_field" in src:
+                files[target] = src
+        followups.append({**f, "files": files})
+    return {
+        "text": result.text,
+        "images": images,
+        "audio": store_media(result.audio, "audio/mpeg") if result.audio else None,
+        "video": store_media(result.video, "video/mp4") if result.video else None,
+        "chat_note": chat_note,
+        "followups": followups,
+        "character": result.character,
+        "refinable": refinable and bool(result.text),
+    }
+
+
+def start_job(app: web.Application, user_id: int, title: str, work, to_chat: bool,
+              refine_ctx_getter=None) -> Job:
+    now = time.time()
+    for key in [k for k, j in _jobs.items() if now - j.created > MEDIA_TTL]:
+        del _jobs[key]
+    job = Job(id=secrets.token_urlsafe(12), user_id=user_id, title=title)
+    _jobs[job.id] = job
+
+    async def runner() -> None:
+        started = time.monotonic()
+        try:
+            result: Result = await work()
+            job.refine = refine_ctx_getter() if refine_ctx_getter else None
+            note = await send_to_chat(app["bot"], user_id, title, result, to_chat)
+            job.result = serialize(result, note, job.refine is not None)
+            job.status = "done"
+        except AIError as e:
+            job.error, job.status = str(e), "error"
+        except Exception as e:  # ошибки API провайдеров: нет баланса, неверный ключ и т.п.
+            log.exception("job %s (%s) failed", job.id, title)
+            job.error, job.status = f"{type(e).__name__}: {str(e)[:500]}", "error"
+        elapsed = time.monotonic() - started
+        log.info("job %s (%s) %s in %.1fs", job.id, title, job.status, elapsed)
+        if job.status == "error" and elapsed > 30 and app["bot"] is not None:
+            # пользователь мог уже закрыть приложение — сообщим об ошибке в чат
+            try:
+                await app["bot"].send_message(user_id, f"⚠️ {title}: {job.error}")
+            except Exception as e:
+                log.warning("cannot notify about error: %s", e)
+
+    task = asyncio.create_task(runner())
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    return job
+
+
 async def api_run(request: web.Request) -> web.Response:
     tool = TOOLS_BY_ID.get(request.match_info["tool_id"])
     if not tool:
@@ -100,25 +178,43 @@ async def api_run(request: web.Request) -> web.Response:
     ctx = RunContext(
         values=values, files=files,
         provider=values.pop("_provider", "claude"), lang=values.pop("_lang", "ru"),
+        character=values.pop("_character", "").strip(),
+        character_media=files.pop("_character_photos", [])[:3],
     )
     to_chat = values.pop("_to_chat", "1") == "1"
-    started = time.monotonic()
-    try:
-        result = await run_tool(tool, ctx)
-    except AIError as e:
-        return web.json_response({"error": str(e)}, status=400)
-    except Exception as e:  # ошибки API провайдеров: нет баланса, неверный ключ и т.п.
-        log.exception("tool %s failed", tool.id)
-        return web.json_response({"error": f"{type(e).__name__}: {str(e)[:500]}"}, status=502)
-    log.info("tool %s done in %.1fs", tool.id, time.monotonic() - started)
+    job = start_job(request.app, request["user"]["id"], tool.title, lambda: run_tool(tool, ctx), to_chat,
+                    lambda: ctx.refine)
+    return web.json_response({"job": job.id})
 
-    chat_note = await send_to_chat(request.app["bot"], request["user"]["id"], tool.title, result, to_chat)
+
+async def api_refine(request: web.Request) -> web.Response:
+    data = await request.json()
+    base = _jobs.get(data.get("job", ""))
+    instruction = (data.get("instruction") or "").strip()
+    if not instruction:
+        return web.json_response({"error": "Напишите, что изменить."}, status=400)
+    if not base or base.user_id != request["user"]["id"] or not base.refine:
+        return web.json_response({"error": "Контекст устарел (сервер перезапускался или прошло больше 3 часов). "
+                                           "Запустите генерацию заново."}, status=410)
+    context = base.refine
+    previous = data.get("text") or (base.result or {}).get("text", "")
+
+    async def work() -> Result:
+        return Result(text=await refine(context, previous, instruction))
+
+    job = start_job(request.app, request["user"]["id"], base.title, work, data.get("to_chat", True),
+                    lambda: context)
+    return web.json_response({"job": job.id})
+
+
+async def api_job(request: web.Request) -> web.Response:
+    job = _jobs.get(request.match_info["job_id"])
+    if not job or job.user_id != request["user"]["id"]:
+        return web.json_response({"status": "missing", "error": "Задача не найдена (сервер перезапускался?)"},
+                                 status=404)
     return web.json_response({
-        "text": result.text,
-        "images": [store_media(i, "image/png") for i in result.images],
-        "audio": store_media(result.audio, "audio/mpeg") if result.audio else None,
-        "video": store_media(result.video, "video/mp4") if result.video else None,
-        "chat_note": chat_note,
+        "status": job.status, "result": job.result, "error": job.error,
+        "elapsed": round(time.time() - job.created),
     })
 
 
@@ -189,5 +285,7 @@ def create_app(bot: Bot | None) -> web.Application:
     app.router.add_get("/api/voices", api_voices)
     app.router.add_post("/api/run/{tool_id}", api_run)
     app.router.add_post("/api/send", api_send)
+    app.router.add_post("/api/refine", api_refine)
+    app.router.add_get("/api/jobs/{job_id}", api_job)
     app.router.add_static("/static/", WEBAPP_DIR)
     return app

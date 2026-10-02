@@ -1,13 +1,12 @@
 """ElevenLabs: озвучка текста, клонирование голоса и замена голоса (speech-to-speech)."""
 
 import asyncio
-import os
-import tempfile
 
 import aiohttp
 
 from .. import config
 from .llm import AIError, Media, require
+from .media import to_audio
 
 API = "https://api.elevenlabs.io/v1"
 TIMEOUT = aiohttp.ClientTimeout(total=600)
@@ -71,46 +70,45 @@ async def speech_to_speech(voice_id: str, audio: Media, remove_noise: bool) -> b
             return await r.read()
 
 
-# --- ffmpeg: извлечь звук из видео и вставить новый звук обратно ---
+# --- Дубляж: перевод видео/аудио на другой язык голосами исходных спикеров с сохранением фона ---
+
+DUB_POLL_SECONDS = 10
+DUB_MAX_WAIT = 30 * 60
 
 
-async def _ffmpeg(*args: str) -> None:
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-loglevel", "error", *args,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-    )
-    _, err = await proc.communicate()
-    if proc.returncode != 0:
-        raise AIError(f"ffmpeg: {err.decode(errors='ignore')[:300]}")
+async def dub(media: Media, target_lang: str, source_lang: str = "auto", num_speakers: int = 0) -> tuple[bytes, str]:
+    """Возвращает (файл, mime). Для видео ElevenLabs отдаёт mp4, для аудио — mp3."""
+    form = aiohttp.FormData()
+    ext = "mp4" if media.is_video else "mp3"
+    form.add_field("file", media.data, filename=f"source.{ext}", content_type=media.mime)
+    form.add_field("target_lang", target_lang)
+    form.add_field("source_lang", source_lang)
+    form.add_field("num_speakers", str(num_speakers))
+    form.add_field("watermark", "false")
+    form.add_field("drop_background_audio", "false")
+    form.add_field("name", f"myaihelper-{target_lang}")
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
+        async with s.post(f"{API}/dubbing", headers=_headers(), data=form) as r:
+            await _check(r)
+            dubbing_id = (await r.json())["dubbing_id"]
 
+        waited = 0
+        while True:
+            await asyncio.sleep(DUB_POLL_SECONDS)
+            waited += DUB_POLL_SECONDS
+            async with s.get(f"{API}/dubbing/{dubbing_id}", headers=_headers()) as r:
+                await _check(r)
+                info = await r.json()
+            status = info.get("status")
+            if status == "dubbed":
+                break
+            if status == "failed":
+                raise AIError(f"ElevenLabs: дубляж не удался. {info.get('error', '')}".strip())
+            if waited >= DUB_MAX_WAIT:
+                raise AIError("ElevenLabs: дубляж идёт слишком долго. Попробуйте ролик короче.")
 
-async def to_audio(m: Media) -> Media:
-    """Видео → mp3. Аудио возвращается как есть."""
-    if not m.is_video:
-        return m
-    with tempfile.TemporaryDirectory() as tmp:
-        src, dst = os.path.join(tmp, "in"), os.path.join(tmp, "out.mp3")
-        with open(src, "wb") as f:
-            f.write(m.data)
-        await _ffmpeg("-i", src, "-vn", "-ac", "1", "-ar", "44100", "-b:a", "128k", dst)
-        with open(dst, "rb") as f:
-            return Media(f.read(), "audio/mpeg", "audio.mp3")
-
-
-async def replace_audio(video: Media, audio_mp3: bytes) -> bytes:
-    """Подменяет звуковую дорожку видео."""
-    with tempfile.TemporaryDirectory() as tmp:
-        v, a, out = (os.path.join(tmp, n) for n in ("in", "voice.mp3", "out.mp4"))
-        with open(v, "wb") as f:
-            f.write(video.data)
-        with open(a, "wb") as f:
-            f.write(audio_mp3)
-        common = ["-i", v, "-i", a, "-map", "0:v:0", "-map", "1:a:0"]
-        tail = ["-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", out]
-        try:
-            await _ffmpeg(*common, "-c:v", "copy", *tail)
-        except AIError:
-            # Видеокодек не помещается в mp4 (например, webm) — перекодируем
-            await _ffmpeg(*common, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", *tail)
-        with open(out, "rb") as f:
-            return f.read()
+        async with s.get(f"{API}/dubbing/{dubbing_id}/audio/{target_lang}", headers=_headers()) as r:
+            await _check(r)
+            data = await r.read()
+            mime = r.headers.get("Content-Type", "video/mp4" if media.is_video else "audio/mpeg").split(";")[0]
+    return data, mime
