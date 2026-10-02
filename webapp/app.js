@@ -296,7 +296,7 @@ function inline(s) {
 }
 
 function codeBlock(code, lang) {
-  const label = /^(srt|json|html|css|js)$/i.test(lang) ? lang.toUpperCase() : "Промпт";
+  const label = /^(srt|json|html|css|js)$/i.test(lang) ? lang.toUpperCase() : /^text$/i.test(lang) ? "Текст" : "Промпт";
   const toVideo = label === "Промпт" && canMakeVideo() && code.length > 40
     ? `<button type="button" data-code-video>${icon("play", "sm")}Видео</button>` : "";
   return `<div class="code"><div class="code-head"><span>${esc(label)}</span><div class="code-actions">${toVideo}

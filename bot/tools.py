@@ -7,7 +7,7 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from . import config
+from . import config, prompt_rules
 from .ai import images, llm, media, subtitles, video, voice
 from .ai.llm import AIError, Media
 
@@ -59,6 +59,8 @@ class Tool:
     uses_llm: bool = True  # показывать выбор модели (Claude / ChatGPT / Gemini)
     needs: tuple[str, ...] = ()  # обязательные ключи API
     hint: str = ""
+    generator: str = ""  # под какой генератор пишутся промпты (иначе — из поля target)
+    seconds_field: str = ""  # поле с длительностью ролика/сцены
     character: bool = False  # можно подставить персонажа из библиотеки
 
     def public(self) -> dict:
@@ -132,9 +134,9 @@ def lang_rule(lang: str, prompts_in_english: bool = True) -> str:
     if prompts_in_english:
         rule += (
             " Промпты для нейросетей-генераторов (то, что пользователь будет копировать в генератор) "
-            "пиши на английском и помещай каждый в отдельный блок кода ```, потому что генераторы "
-            "лучше понимают английский. Реплики и закадровый текст — на языке, который укажет пользователь, "
-            "а если не указал — на языке ответа."
+            "пиши на английском, каждый — в отдельном блоке кода с пометкой ```prompt. Вспомогательные "
+            "английские блоки (character bible, style bible, negative prompt) помечай ```text. "
+            "Реплики героев — в кавычках на языке, который укажет пользователь (а если не указал — на языке ответа)."
         )
     return rule
 
@@ -191,11 +193,44 @@ async def ask(ctx: RunContext, system: str, prompt: str, media: list[Media] | No
     return answer
 
 
+def target_of(tool: Tool, ctx: RunContext) -> tuple[str, int]:
+    """Генератор и длительность, под которые пишутся промпты в этом запросе."""
+    generator = tool.generator or ctx.v("target")
+    seconds = int(re.sub(r"\D", "", ctx.v(tool.seconds_field)) or 8) if tool.seconds_field else 8
+    return generator, (prompt_rules.clamp_seconds(generator, seconds) if generator else seconds)
+
+
+async def enforce_format(ctx: RunContext, system: str, answer: str, generator: str, seconds: int,
+                         refs: int) -> str:
+    """Проверяет промпты в ответе по правилам генератора; при нарушениях один раз просит модель исправить."""
+    issues = prompt_rules.check_answer(answer, generator, seconds, refs)
+    if not issues:
+        return answer
+    log.info("prompt format issues (%s): %s", generator, issues)
+    fixed = await llm.generate_text(
+        ctx.refine["provider"] if ctx.refine else ctx.provider, system,
+        "Ниже твой ответ. Автоматическая проверка нашла нарушения формата промптов:\n- "
+        + "\n- ".join(issues)
+        + "\n\nИсправь ВСЕ нарушения и верни ПОЛНЫЙ исправленный ответ целиком, в том же оформлении, "
+        "без комментариев об исправлениях.\n\n## Ответ\n" + answer,
+    )
+    left = prompt_rules.check_answer(fixed, generator, seconds, refs)
+    if left:
+        fixed += "\n\n⚠️ Автопроверка формата: " + "; ".join(left)
+    return fixed
+
+
 async def run_text(tool: Tool, ctx: RunContext) -> Result:
     media = all_media(tool, ctx)
     note = "К сообщению приложены файлы пользователя — внимательно изучи их." if media else ""
-    system = f"{PRODUCER}\n\n{tool.system}\n\n{lang_rule(ctx.lang)}".strip()
-    return Result(text=await ask(ctx, system, build_prompt(tool, ctx, attachments_note=note), media))
+    generator, seconds = target_of(tool, ctx)
+    rules = f"\n\n{prompt_rules.rules_for(generator, seconds)}" if generator else ""
+    system = f"{PRODUCER}\n\n{tool.system}{rules}\n\n{lang_rule(ctx.lang)}".strip()
+    answer = await ask(ctx, system, build_prompt(tool, ctx, attachments_note=note), media)
+    if generator:
+        refs = len([m for m in media if m.is_image])
+        answer = await enforce_format(ctx, system, answer, generator, seconds, refs)
+    return Result(text=answer)
 
 
 REFINE_TASK = (
@@ -299,9 +334,16 @@ async def run_video_study(tool: Tool, ctx: RunContext) -> Result:
             f"\n\nВ самом конце ответа отдельной строкой выведи «{ANIM_MARK} <промпт на английском для "
             "image-to-video: действие и движение героя и камеры на протяжении всего ролика, без описания внешности>»."
         )
-    system = f"{PRODUCER}\n\nТы внимательно анализируешь видео, точно расставляешь таймкоды.\n\n{lang_rule(ctx.lang)}"
+    generator = ctx.v("target", "veo")
+    seconds = prompt_rules.GENERATORS.get(generator, prompt_rules.GENERATORS["veo"]).max_seconds
+    seconds = min(seconds, 8 if generator == "veo" else 15)
+    rules = prompt_rules.rules_for(generator, seconds) if mode != "translate" else ""
+    system = (f"{PRODUCER}\n\nТы внимательно анализируешь видео, точно расставляешь таймкоды. "
+              f"Промпты сцен — не длиннее {seconds} с каждая.\n\n{rules}\n\n{lang_rule(ctx.lang)}")
     note = "Первый файл — видео. Изображения (если есть) — фото нового персонажа."
     answer = await ask(ctx, system, build_prompt(tool, ctx, task, note), all_media(tool, ctx), provider="gemini")
+    if rules:
+        answer = await enforce_format(ctx, system, answer, generator, seconds, 0)
 
     anim = ""
     found = re.search(rf"{ANIM_MARK}\s*(.+)", answer)
@@ -348,21 +390,34 @@ async def run_video_study(tool: Tool, ctx: RunContext) -> Result:
     return result
 
 
+IMAGE_GUIDE_GEMINI = (
+    "Формат для Nano Banana (гайд Google): пиши связным описанием, как бриф художнику, а не списком "
+    "ключевых слов — сюжет, объект, композиция, действие, место, стиль, свет, камера. Для узнаваемого героя "
+    "перечисли неизменные черты (лицо, причёска, цвета одежды, пропорции). Текст на картинке — в кавычках."
+)
+IMAGE_GUIDE_OPENAI = (
+    "Формат для GPT Image 2.5 (гайд OpenAI): начни с того, что это за изображение и в каком формате; затем "
+    "блоки Scene (место, время, окружение) → Subject (кто/что) → Details (композиция, свет, материалы, стиль) → "
+    "Constraints (что не должно меняться или появляться). Точный текст на картинке — в двойных кавычках."
+)
+
+
 async def run_image(tool: Tool, ctx: RunContext) -> Result:
     prompt, refs = ctx.v("prompt"), (ctx.f("refs") + ctx.character_media)[:4]
     if ctx.character:
         prompt += f"\n\nCharacter (keep appearance exactly): {ctx.character}"
     note = ""
+    engine = image_engine(ctx.v("engine"))
     if ctx.flag("enhance"):
+        guide = IMAGE_GUIDE_OPENAI if images.provider_of(engine) == "openai" else IMAGE_GUIDE_GEMINI
         system = (
-            "Ты — эксперт по промптам для генерации изображений. Перепиши запрос пользователя в один "
-            "детальный промпт на английском: объект, композиция, ракурс, объектив, свет, стиль, "
-            "цветовая палитра, детализация. Если приложены референсы — опиши, как их использовать. "
-            "Верни ТОЛЬКО сам промпт, без пояснений и кавычек."
+            "Ты — эксперт по промптам для генерации изображений. Перепиши запрос пользователя в один промпт "
+            f"на английском.\n{guide}\n"
+            + (f"Референсов приложено: {len(refs)} — назови роль каждого (Image 1, Image 2…).\n" if refs else "")
+            + "Верни ТОЛЬКО сам промпт, без пояснений и кавычек вокруг него."
         )
         prompt = await llm.generate_text(ctx.provider, system, prompt, refs)
-        note = f"**Улучшенный промпт:**\n```\n{prompt}\n```"
-    engine = image_engine(ctx.v("engine"))
+        note = f"**Улучшенный промпт:**\n```prompt\n{prompt}\n```"
     tasks = [images.generate_image(engine, prompt, refs, ctx.v("size", "1024x1536"), ctx.v("quality", "auto"))
              for _ in range(int(ctx.v("count", "1")))]
     imgs, failed = await gather_images(tasks)
@@ -425,9 +480,10 @@ async def run_angles(tool: Tool, ctx: RunContext) -> Result:
         + (f"Пожелания пользователя: {ctx.v('wishes')}\n" if ctx.v("wishes") else "")
         + "Верни ТОЛЬКО JSON без пояснений в формате:\n"
         '{"scene": "описание исходного кадра", "angles": [{"name": "название ракурса", '
-        '"why": "зачем этот ракурс в монтаже", "image_prompt": "English prompt for regenerating '
-        'this exact scene from the new angle", "video_prompt": "English image-to-video prompt, '
-        '5 seconds, camera and subject motion"}]}\n'
+        '"why": "зачем этот ракурс в монтаже", "image_prompt": "English edit instruction for the reference '
+        'frame: the new camera position, shot size, lens and what must stay identical", "video_prompt": '
+        '"English Veo 3.1 image-to-video prompt: only camera and subject motion over 8 seconds plus one '
+        'SFX: line and one Ambient noise: line; do not re-describe the frame"}]}\n'
         f"Поля scene, name и why пиши на {lang} языке."
     )
     data = extract_json(await llm.generate_text(ctx.provider, system, prompt, frame))
@@ -534,8 +590,10 @@ async def run_character(tool: Tool, ctx: RunContext) -> Result:
         "## Имя и роль\n## Внешность — максимально подробно: возраст, тип лица, глаза, брови, нос, губы, "
         "кожа, волосы (цвет, длина, укладка), телосложение, рост, особые приметы\n"
         "## Одежда и стиль\n## Характер, манера двигаться и говорить, голос\n"
-        "## Промпт персонажа — 60–90 слов на английском, который можно вставлять в каждый промпт "
-        "для узнаваемости\n## Negative prompt — чего избегать\n"
+        "## Неизменные черты — короткий список: форма лица, глаза, причёска, цвета и детали одежды, пропорции\n"
+        "## Промпт персонажа — 60–90 слов на английском в блоке ```prompt, который можно вставлять в каждый "
+        "промпт для узнаваемости (описание связным текстом, без списка ключевых слов)\n"
+        "## Negative prompt — чего избегать (```text)\n"
         "## Как использовать: советы для Seedance/Kling/Veo/Nano Banana, чтобы персонаж не менялся.",
         "Приложены фото персонажа (до 3 шт.).",
     )
@@ -566,11 +624,10 @@ async def run_character(tool: Tool, ctx: RunContext) -> Result:
 
 
 VIDEO_ENHANCE = (
-    "Ты — режиссёр AI-видео. Перепиши запрос пользователя в один промпт на английском для {engine}: "
-    "кто в кадре, что происходит по секундам, движение камеры и объектив, свет, стиль и цвет, атмосфера, "
-    "звук и реплики (реплики — в кавычках, на языке пользователя). Длительность {seconds} секунд, формат {aspect}. "
-    "Если приложен первый кадр — опиши движение от него, не меняя внешность и окружение. "
-    "Верни ТОЛЬКО сам промпт, без пояснений."
+    "Ты — режиссёр AI-видео. Перепиши запрос пользователя в один готовый промпт для {engine}, "
+    "формат {aspect}.\n{rules}\n"
+    "Реплики героев оставь на языке пользователя, в кавычках. "
+    "Верни ТОЛЬКО сам промпт, без пояснений и без блоков кода."
 )
 
 
@@ -590,22 +647,39 @@ async def run_video_gen(tool: Tool, ctx: RunContext) -> Result:
     if engine == "omni":
         prompt += f"\n\nTarget length: about {seconds} seconds."
     if ctx.flag("enhance"):
-        system = VIDEO_ENHANCE.format(engine=ENGINE_NAMES.get(engine, "Veo"), seconds=seconds, aspect=aspect)
+        generator = "omni" if engine == "omni" else "veo"
+        seconds = prompt_rules.clamp_seconds(generator, seconds)
+        system = VIDEO_ENHANCE.format(engine=ENGINE_NAMES.get(engine, "Veo"), aspect=aspect,
+                                      rules=prompt_rules.rules_for(generator, seconds))
         refs = ([image] if image else []) + ctx.character_media[:2]
-        prompt = await llm.generate_text(ctx.provider, system, prompt, refs)
+        prompt = (await llm.generate_text(ctx.provider, system, prompt, refs)).strip().strip("`")
+        issues = prompt_rules.check_prompt(prompt, generator, seconds)
+        if issues:
+            prompt = (await llm.generate_text(
+                ctx.provider, system,
+                "Исправь промпт, нарушения: " + "; ".join(issues) + ". Верни только исправленный промпт.\n\n" + prompt,
+            )).strip().strip("`")
     clip = await video.generate_video(engine, prompt, image, ctx.character_media, aspect, seconds, resolution)
-    result = Result(text=f"**{ENGINE_NAMES.get(engine, engine)} · {resolution}**\n\n**Промпт:**\n```\n{prompt}\n```", video=clip)
+    result = Result(text=f"**{ENGINE_NAMES.get(engine, engine)} · {resolution}**\n\n**Промпт:**\n```prompt\n{prompt}\n```", video=clip)
     result.followups.append({"label": "Продлить это видео (Omni)", "tool": "video_edit",
                              "values": {"mode": "extend"}, "files": {"source": {"video": True}}})
     return result
 
 
-EDIT_TASKS = {
-    "edit": "Edit the input video according to the instruction. Keep everything that is not mentioned unchanged: "
-            "timing, camera motion, framing, lighting and audio.",
-    "extend": "Continue the input video seamlessly from its last frame: same characters, location, lighting and style.",
+OMNI_EDIT_GUIDE = {
+    "edit": (
+        "Перепиши просьбу пользователя в промпт редактирования видео для Gemini Omni Flash (на английском). "
+        "Гайд: правка — это «дельта», а не описание сцены. 2–3 предложения: глагол изменения (Replace / Change / "
+        "Add / Remove / Restyle), уточнение, и обязательная фраза-фиксатор: что сохранить (движения, тайминг, "
+        "камера, фон, голос) и «Keep everything else identical.». Если приложены референсы — сошлись на них как "
+        "«the person/object in the reference image». Верни только промпт."
+    ),
+    "extend": (
+        "Перепиши просьбу в промпт продления видео для Gemini Omni Flash (на английском): что происходит дальше "
+        "(1–2 предложения) и фиксатор «Continue seamlessly from the last frame with the same characters, location, "
+        "lighting and camera style.». Верни только промпт."
+    ),
 }
-
 
 async def run_video_edit(tool: Tool, ctx: RunContext) -> Result:
     llm.require("gemini")
@@ -617,11 +691,14 @@ async def run_video_edit(tool: Tool, ctx: RunContext) -> Result:
     instruction = ctx.v("instruction")
     if mode == "edit" and not instruction:
         raise AIError("Опишите, что изменить в видео.")
-    prompt = f"{EDIT_TASKS[mode]}\n\nInstruction: {instruction or 'continue the action naturally'}"
-    if refs:
-        prompt += "\nUse the reference image(s) for the appearance of the new character/object."
+    request = instruction or "continue the action naturally"
     if ctx.character:
-        prompt += f"\nCharacter description: {ctx.character}"
+        request += f"\nCharacter description: {ctx.character}"
+    if refs:
+        request += f"\n({len(refs)} reference image(s) attached for the new character/object.)"
+    providers = config.available_providers()
+    llm_provider = next((p for p in (ctx.provider, "gemini", "claude", "openai") if providers.get(p)), "gemini")
+    prompt = (await llm.generate_text(llm_provider, OMNI_EDIT_GUIDE[mode], request)).strip().strip("`")
     clip = await video.edit_video(src[0], prompt, refs, mode, ctx.v("resolution", "1080p"), ctx.v("aspect", "9:16"))
     label = "Видео отредактировано" if mode == "edit" else "Видео продлено"
     return Result(text=f"✅ {label} в Gemini Omni Flash 1.1.", video=clip)
@@ -669,6 +746,8 @@ TOOLS: list[Tool] = [
             files("video", "Видео", "video/*", required=True),
             select("mode", "Что сделать", [("full", "Полный разбор + промпты"), ("translate", "Перевод речи"),
                                           ("replace", "Замена персонажа")]),
+            select("target", "Промпты сцен под генератор", prompt_rules.TARGET_OPTIONS,
+                   show_if={"mode": ["full", "replace"]}),
             select("target_lang", "Язык перевода", OUT_LANGS),
             area("new_character", "Новый персонаж", "Опишите, на кого заменить (необязательно)"),
             files("character_photo", "Фото нового персонажа", "image/*"),
@@ -695,23 +774,29 @@ TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        "seedance", "Seedance промпт", "Профессиональный режиссёрский промпт", "zap", "prompts",
+        "seedance", "Seedance 2.5 промпт", "Режиссёрский промпт по официальной структуре", "zap", "prompts",
         [
-            area("idea", "Идея сцены", "Что должно происходить в видео", True),
-            select("duration", "Длительность", ["5 секунд", "10 секунд", "15 секунд"], "10 секунд"),
-            select("aspect", "Формат", ASPECTS),
+            area("idea", "Идея сцены", "Что должно происходить в видео, реплики героев", True),
+            select("duration", "Длительность", [("4", "4 с"), ("6", "6 с"), ("8", "8 с"), ("10", "10 с"),
+                                                 ("12", "12 с"), ("15", "15 с"), ("20", "20 с"),
+                                                 ("25", "25 с"), ("30", "30 с")], "10"),
+            select("aspect", "Формат", [("9:16", "9:16"), ("16:9", "16:9"), ("1:1", "1:1"), ("4:3", "4:3"),
+                                        ("3:4", "3:4"), ("21:9", "21:9")]),
             text("style", "Стиль", "Например: кинематографичный, аниме, реклама, документальный"),
-            files("ref", "Референс (персонаж или стиль)", "image/*"),
+            files("ref", "Референсы (герой, продукт, локация)", "image/*", multiple=True, max_files=9),
         ],
-        system="Ты пишешь промпты уровня профессионального режиссёра и оператора для Seedance (ByteDance).",
+        system="Ты пишешь промпты уровня профессионального режиссёра и оператора для Seedance 2.5 (ByteDance).",
         task=(
-            "Напиши режиссёрский промпт для Seedance. Сначала раскадровка по шотам с таймкодами "
-            "([0–3s], [3–6s] …): крупность плана, движение камеры (dolly in, orbit, crane, handheld, FPV), "
-            "объектив, действие, свет, цветокоррекция, атмосфера, звук. Затем **финальный промпт** одним "
-            "блоком на английском. Потом — чего избегать, и 2 альтернативы: более динамичная и более "
-            "атмосферная. Если приложен референс — персонаж и стиль должны с ним совпадать."
+            "Напиши промпт для Seedance 2.5 под длительность {duration} с и формат {aspect}.\n"
+            "1. Коротко (на языке ответа): замысел и раскадровка по отрезкам — что в кадре, крупность, "
+            "движение камеры, звук.\n2. **Финальный промпт** — один блок ```prompt строго по формату Seedance 2.5.\n"
+            "3. Две альтернативы (более динамичная и более атмосферная) — тоже полноценные промпты ```prompt "
+            "той же длительности.\nЕсли приложены референсы — пронумеруй их @Image1, @Image2… в порядке "
+            "приложения и привяжи к ролям."
         ),
-        character=True,
+        character=True, generator="seedance", seconds_field="duration",
+        hint="Промпт пишется по официальной структуре Seedance 2.5 и проверяется автоматически: "
+             "таймлайн, длительность, привязка референсов.",
     ),
     Tool(
         "minidrama", "Мини-драма", "Вертикальный сериал из 5 серий", "clapper", "scripts",
@@ -721,6 +806,8 @@ TOOLS: list[Tool] = [
                                      "Мистика", "Бизнес / успех"]),
             select("length", "Длина серии", ["30 секунд", "60 секунд", "90 секунд"], "60 секунд"),
             text("dialog_lang", "Язык диалогов", "Например: узбекский"),
+            select("target", "Промпты под генератор", prompt_rules.TARGET_OPTIONS),
+            select("scene_len", "Длина одной сцены", [("8", "8 с"), ("10", "10 с"), ("15", "15 с")], "8"),
         ],
         system="Ты — шоураннер вертикальных мини-сериалов, которые смотрят запоем.",
         task=(
@@ -728,28 +815,31 @@ TOOLS: list[Tool] = [
             "Сначала: название, логлайн, персонажи — для каждого подробная внешность и одежда "
             "(одинаковое описание будем использовать во всех промптах) и промпт для character sheet.\n"
             "Для каждой серии: название, сцены с таймкодами, диалоги, клиффхэнгер в конце и "
-            "промпт для AI-видео на каждую сцену (8–10 секунд) с одинаковыми описаниями персонажей."
+            "промпт ```prompt для выбранного генератора на каждую сцену (длительность сцены — {scene_len} с, "
+            "но не больше лимита генератора) с дословно одинаковыми описаниями персонажей."
         ),
-        character=True,
+        character=True, seconds_field="scene_len",
     ),
     Tool(
-        "serial", "Создание сериала", "Связанные 10-секундные промпты", "layers", "prompts",
+        "serial", "Создание сериала", "Связанные сцены под Veo, Seedance, Kling, Grok", "layers", "prompts",
         [
             area("story", "История", "Перескажите сюжет целиком", True),
             number("scenes", "Количество сцен", 6, 2, 20),
+            select("target", "Промпты под генератор", prompt_rules.TARGET_OPTIONS),
+            select("scene_len", "Длина одной сцены", [("8", "8 с"), ("10", "10 с"), ("15", "15 с")], "8"),
             area("character", "Персонажи", "Внешность героев (необязательно — придумаем)"),
             text("style", "Визуальный стиль", "Например: кино 35мм, Pixar 3D, аниме"),
             files("ref", "Референс персонажа", "image/*"),
         ],
         system="Ты отвечаешь за непрерывность (continuity) AI-сериала: персонажи и мир не должны «плыть».",
         task=(
-            "Разбей историю на {scenes} связанных 10-секундных сцен для AI-видео (Seedance/Kling/Veo).\n"
-            "Начни с блоков **Character bible** и **Style bible** (на английском).\n"
-            "Для каждой сцены: описание, промпт на английском (дословно повторяй блок персонажа и стиля в "
+            "Разбей историю на {scenes} связанных сцен по {scene_len} с (не больше лимита выбранного генератора).\n"
+            "Начни с блоков **Character bible** и **Style bible** (на английском, в ```text).\n"
+            "Для каждой сцены: описание, промпт ```prompt (дословно повторяй блок персонажа и стиля в "
             "каждом промпте), **последний кадр** — его можно использовать как стартовый кадр следующей "
             "сцены, и реплика/закадровый текст. Каждая сцена продолжает предыдущую без скачков."
         ),
-        character=True,
+        character=True, seconds_field="scene_len",
     ),
     Tool(
         "grok", "Промпты для Grok", "Кадры, как в кино", "aperture", "prompts",
@@ -758,15 +848,17 @@ TOOLS: list[Tool] = [
             select("genre", "Жанр", ["Драма", "Боевик", "Нуар", "Фантастика", "Хоррор", "Романтика",
                                      "Исторический", "Реклама"]),
             number("count", "Сколько кадров", 6, 1, 20),
+            select("seconds", "Длина анимации", [("6", "6 с"), ("10", "10 с"), ("15", "15 с")], "10"),
         ],
         system="Ты — оператор-постановщик голливудского уровня и знаешь, как писать промпты для Grok Imagine.",
         task=(
             "Напиши {count} промптов для Grok Imagine, чтобы кадры выглядели как из большого кино. "
-            "Для каждого: название кадра, **промпт изображения** (subject, action, composition, lens — "
-            "например 35mm / anamorphic, lighting, color grade, film stock, mood) и **промпт анимации** "
-            "(движение камеры и героя, ~6 секунд)."
+            "Для каждого: название кадра, **промпт изображения** ```prompt (subject, action, environment, "
+            "style, camera & lighting — например 35mm / anamorphic, color grade, film stock, mood) и "
+            "**промпт анимации** ```prompt — короткий (1–2 предложения), только движение камеры и героя "
+            "и конкретный звук, на {seconds} с."
         ),
-        character=True,
+        character=True, generator="grok", seconds_field="seconds",
     ),
     Tool(
         "image", "Изображения", "GPT Image 2.5 и Nano Banana", "image", "visual",
