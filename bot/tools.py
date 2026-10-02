@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from . import config
-from .ai import images, llm, media, video, voice
+from .ai import images, llm, media, subtitles, video, voice
 from .ai.llm import AIError, Media
 
 log = logging.getLogger(__name__)
@@ -103,19 +103,21 @@ ASPECTS = [("9:16", "9:16"), ("16:9", "16:9"), ("1:1", "1:1")]
 OUT_LANGS = [("русский", "Русский"), ("узбекский", "Узбекский"), ("английский", "Английский"),
              ("казахский", "Казахский"), ("турецкий", "Турецкий")]
 
-# Языки дубляжа ElevenLabs (если язык не поддерживается — ElevenLabs вернёт ошибку)
-DUB_LANGS = [("en", "Английский"), ("ru", "Русский"), ("uz", "Узбекский"), ("kk", "Казахский"),
-             ("tr", "Турецкий"), ("uk", "Украинский"), ("ar", "Арабский"), ("de", "Немецкий"),
-             ("fr", "Французский"), ("es", "Испанский"), ("it", "Итальянский"), ("pt", "Португальский"),
-             ("pl", "Польский"), ("hi", "Хинди"), ("zh", "Китайский"), ("ja", "Японский"),
-             ("ko", "Корейский"), ("id", "Индонезийский")]
+# Языки дубляжа ElevenLabs Dubbing v2 (поддерживает 90+ языков; здесь — самые нужные)
+DUB_LANGS = [("uz", "Узбекский"), ("ru", "Русский"), ("en", "Английский"), ("kk", "Казахский"),
+             ("ky", "Киргизский"), ("tg", "Таджикский"), ("tk", "Туркменский"), ("az", "Азербайджанский"),
+             ("tr", "Турецкий"), ("uk", "Украинский"), ("fa", "Персидский"), ("ar", "Арабский"),
+             ("hi", "Хинди"), ("ur", "Урду"), ("de", "Немецкий"), ("fr", "Французский"), ("es", "Испанский"),
+             ("it", "Итальянский"), ("pt", "Португальский"), ("pl", "Польский"), ("zh", "Китайский"),
+             ("ja", "Японский"), ("ko", "Корейский"), ("id", "Индонезийский"), ("vi", "Вьетнамский"),
+             ("th", "Тайский"), ("mn", "Монгольский")]
 
 # ---------- общие промпты ----------
 
 PRODUCER = (
     "Ты — опытный креативный продюсер, сценарист и режиссёр коротких вертикальных видео "
     "(Reels, TikTok, YouTube Shorts) и эксперт по AI-видео и AI-изображениям "
-    "(Seedance, Kling, Veo, Sora, Runway, Hailuo, Grok Imagine, Midjourney, GPT Image, Nano Banana). "
+    "(Seedance, Kling, Veo, Gemini Omni, Runway, Hailuo, Grok Imagine, Midjourney, GPT Image, Nano Banana). "
     "Отвечаешь конкретно, без воды и общих советов, сразу готовым к использованию результатом."
 )
 
@@ -224,13 +226,13 @@ def extract_json(raw: str) -> dict:
 
 
 def image_engine(preferred: str = "") -> str:
+    """Выбранный генератор, а если для него нет ключа — любой доступный."""
     providers = config.available_providers()
-    if preferred in ("gemini", "openai") and providers[preferred]:
+    if preferred in images.ENGINES and providers[images.provider_of(preferred)]:
         return preferred
-    if providers["gemini"]:
-        return "gemini"
-    if providers["openai"]:
-        return "openai"
+    for engine in ("nb2", "flare"):
+        if providers[images.provider_of(engine)]:
+            return engine
     raise AIError("Для генерации изображений нужен ключ Gemini или OpenAI.")
 
 
@@ -328,6 +330,15 @@ async def run_video_study(tool: Tool, ctx: RunContext) -> Result:
             log.warning("character swap failed: %s", e)
             result.text += f"\n\n⚠️ Не удалось заменить персонажа на первом кадре: {e}"
 
+    if mode == "replace" and providers["gemini"]:
+        who = ctx.v("new_character") or "the person from the reference photo"
+        result.followups.insert(0, {
+            "label": "Заменить персонажа во всём видео (Omni)", "tool": "video_edit",
+            "values": {"mode": "edit", "instruction": f"Replace the main character with {who}. "
+                                                      "Keep the same movements, timing, camera, background and voice."},
+            "files": {"source": {"from_field": "video"}, "refs": {"from_field": "character_photo"}},
+        })
+
     if mode in ("translate", "full") and providers["elevenlabs"]:
         result.followups.append({
             "label": "Сделать дубляж (ElevenLabs)", "tool": "voices",
@@ -352,7 +363,7 @@ async def run_image(tool: Tool, ctx: RunContext) -> Result:
         prompt = await llm.generate_text(ctx.provider, system, prompt, refs)
         note = f"**Улучшенный промпт:**\n```\n{prompt}\n```"
     engine = image_engine(ctx.v("engine"))
-    tasks = [images.generate_image(engine, prompt, refs, ctx.v("size", "1024x1024"))
+    tasks = [images.generate_image(engine, prompt, refs, ctx.v("size", "1024x1536"), ctx.v("quality", "auto"))
              for _ in range(int(ctx.v("count", "1")))]
     imgs, failed = await gather_images(tasks)
     if failed:
@@ -367,10 +378,36 @@ async def run_image(tool: Tool, ctx: RunContext) -> Result:
 
 
 async def run_motion(tool: Tool, ctx: RunContext) -> Result:
-    media = ctx.f("media")
-    if not media and not ctx.v("script"):
+    files = ctx.f("media")
+    if not files and not ctx.v("script"):
         raise AIError("Загрузите видео/аудио или вставьте текст сценария.")
-    return await run_text(tool, ctx)
+    if not files or not config.available_providers()["elevenlabs"]:
+        return await run_text(tool, ctx)  # без ElevenLabs: Gemini сам посмотрит видео
+
+    # Точная пословная расшифровка (ElevenLabs Scribe v2) → план по реальным таймкодам
+    source = files[0]
+    transcript = await voice.transcribe(source)
+    phrases = subtitles.phrases_from_words(transcript.get("words", []))
+    if not phrases:
+        raise AIError("В файле не найдена речь.")
+    srt = subtitles.to_srt(phrases)
+    system = f"{PRODUCER}\n\n{tool.system}\n\n{lang_rule(ctx.lang)}"
+    prompt = build_prompt(
+        tool, ctx,
+        "Сделай план моушн-дизайна по готовой расшифровке с точными таймкодами (секунды). Для каждой фразы: "
+        "таймкод, ключевое слово-акцент, анимация (kinetic type, pop-up иконка, счётчик, подчёркивание, стрелки, "
+        "B-roll), элементы на экране, переход, звук (SFX). Затем: общий стиль (шрифты, палитра в HEX, скорость), "
+        "как собрать в CapCut и After Effects, промпты для AI-генерации анимированных вставок.",
+        f"Расшифровка (язык: {transcript.get('language_code', '?')}):\n{subtitles.timeline(phrases)}",
+    )
+    plan = await ask(ctx, system, prompt)
+    result = Result(text=f"{plan}\n\n## Субтитры (SRT)\n```srt\n{srt}```")
+    if source.is_video and ctx.flag("render"):
+        width, height = await media.probe_size(source)
+        ass = subtitles.to_ass(phrases, width, height, ctx.v("style", "Kinetic typography"))
+        result.video = await media.burn_subtitles(source, ass)
+        result.text = "✅ Видео с анимированными субтитрами — выше. Ниже — план моушн-дизайна для монтажа.\n\n" + result.text
+    return result
 
 
 async def run_angles(tool: Tool, ctx: RunContext) -> Result:
@@ -439,28 +476,40 @@ async def run_voices(tool: Tool, ctx: RunContext) -> Result:
     if mode == "tts":
         if not ctx.v("text"):
             raise AIError("Введите текст для озвучки.")
-        return Result(audio=await voice.text_to_speech(ctx.v("voice"), ctx.v("text")))
+        fast = ctx.v("tts_model") == "turbo"
+        return Result(audio=await voice.text_to_speech(ctx.v("voice"), ctx.v("text"), fast))
 
     if mode == "sts":
         src = ctx.f("source")
         if not src:
             raise AIError("Загрузите аудио или видео с речью.")
-        audio = await voice.to_audio(src[0])
+        audio = await media.to_audio(src[0])
         new_audio = await voice.speech_to_speech(ctx.v("voice"), audio, ctx.flag("denoise"))
         if src[0].is_video and ctx.flag("keep_video"):
-            return Result(video=await voice.replace_audio(src[0], new_audio), audio=new_audio)
+            return Result(video=await media.replace_audio(src[0], new_audio), audio=new_audio)
         return Result(audio=new_audio)
 
     if mode == "dub":
         src = ctx.f("source")
         if not src:
             raise AIError("Загрузите видео или аудио для дубляжа.")
-        data, mime = await voice.dub(src[0], ctx.v("target_lang", "en"))
+        track = await voice.dub(src[0], ctx.v("target_lang", "en"))  # FLAC без потерь
         lang = dict(DUB_LANGS).get(ctx.v("target_lang"), ctx.v("target_lang"))
-        note = f"✅ Дубляж на язык: **{lang}**. Голоса спикеров сохранены, фоновая музыка и звуки — тоже."
-        if mime.startswith("video/"):
-            return Result(text=note, video=data)
-        return Result(text=note, audio=data)
+        note = f"✅ Дубляж (Dubbing v2) на язык: **{lang}**. Голоса спикеров и фоновая музыка сохранены."
+        if src[0].is_video:
+            return Result(text=note, video=await media.replace_audio(src[0], track))
+        return Result(text=note, audio=await media.to_mp3(track))
+
+    if mode == "stt":
+        src = ctx.f("source")
+        if not src:
+            raise AIError("Загрузите аудио или видео с речью.")
+        data = await voice.transcribe(src[0])
+        phrases = subtitles.phrases_from_words(data.get("words", []), max_words=8)
+        speakers = {w.get("speaker_id") for w in data.get("words", []) if w.get("speaker_id")}
+        text = f"**Язык:** {data.get('language_code', '?')} · **спикеров:** {len(speakers) or 1}\n\n"
+        text += f"## Текст\n{data.get('text', '').strip()}\n\n## Субтитры (SRT)\n```srt\n{subtitles.to_srt(phrases)}```"
+        return Result(text=text)
 
     if mode == "clone":
         samples = ctx.f("samples")
@@ -525,21 +574,57 @@ VIDEO_ENHANCE = (
 )
 
 
+ENGINE_NAMES = {"veo": "Veo 3.1", "veo_fast": "Veo 3.1 Fast", "omni": "Gemini Omni Flash 1.1"}
+
+
 async def run_video_gen(tool: Tool, ctx: RunContext) -> Result:
+    llm.require("gemini")
     engine = ctx.v("engine", "veo")
-    llm.require("gemini" if engine == "veo" else "openai")
     image = (ctx.f("image") or [None])[0]
     seconds = int(ctx.v("seconds", "8"))
     aspect = ctx.v("aspect", "9:16")
+    resolution = ctx.v("resolution", "1080p")
     prompt = ctx.v("prompt") or "Bring this frame to life with natural, cinematic motion."
     if ctx.character:
         prompt += f"\n\nMain character (keep appearance exactly): {ctx.character}"
+    if engine == "omni":
+        prompt += f"\n\nTarget length: about {seconds} seconds."
     if ctx.flag("enhance"):
-        system = VIDEO_ENHANCE.format(engine="Veo" if engine == "veo" else "Sora", seconds=seconds, aspect=aspect)
+        system = VIDEO_ENHANCE.format(engine=ENGINE_NAMES.get(engine, "Veo"), seconds=seconds, aspect=aspect)
         refs = ([image] if image else []) + ctx.character_media[:2]
         prompt = await llm.generate_text(ctx.provider, system, prompt, refs)
-    clip = await video.generate_video(engine, prompt, image, ctx.character_media, aspect, seconds)
-    return Result(text=f"**Промпт:**\n```\n{prompt}\n```", video=clip)
+    clip = await video.generate_video(engine, prompt, image, ctx.character_media, aspect, seconds, resolution)
+    result = Result(text=f"**{ENGINE_NAMES.get(engine, engine)} · {resolution}**\n\n**Промпт:**\n```\n{prompt}\n```", video=clip)
+    result.followups.append({"label": "Продлить это видео (Omni)", "tool": "video_edit",
+                             "values": {"mode": "extend"}, "files": {"source": {"video": True}}})
+    return result
+
+
+EDIT_TASKS = {
+    "edit": "Edit the input video according to the instruction. Keep everything that is not mentioned unchanged: "
+            "timing, camera motion, framing, lighting and audio.",
+    "extend": "Continue the input video seamlessly from its last frame: same characters, location, lighting and style.",
+}
+
+
+async def run_video_edit(tool: Tool, ctx: RunContext) -> Result:
+    llm.require("gemini")
+    src = ctx.f("source")
+    if not src or not src[0].is_video:
+        raise AIError("Загрузите видео.")
+    mode = ctx.v("mode", "edit")
+    refs = (ctx.f("refs") + ctx.character_media)[:3]
+    instruction = ctx.v("instruction")
+    if mode == "edit" and not instruction:
+        raise AIError("Опишите, что изменить в видео.")
+    prompt = f"{EDIT_TASKS[mode]}\n\nInstruction: {instruction or 'continue the action naturally'}"
+    if refs:
+        prompt += "\nUse the reference image(s) for the appearance of the new character/object."
+    if ctx.character:
+        prompt += f"\nCharacter description: {ctx.character}"
+    clip = await video.edit_video(src[0], prompt, refs, mode, ctx.v("resolution", "1080p"), ctx.v("aspect", "9:16"))
+    label = "Видео отредактировано" if mode == "edit" else "Видео продлено"
+    return Result(text=f"✅ {label} в Gemini Omni Flash 1.1.", video=clip)
 
 
 # ---------- список разделов ----------
@@ -684,17 +769,24 @@ TOOLS: list[Tool] = [
         character=True,
     ),
     Tool(
-        "image", "GPT Image", "Картинка из текста или по референсу", "image", "visual",
+        "image", "Изображения", "GPT Image 2.5 и Nano Banana", "image", "visual",
         [
             area("prompt", "Что нарисовать", "Опишите изображение", True),
             files("refs", "Референсы", "image/*", multiple=True, max_files=4),
-            select("engine", "Генератор", [("openai", "GPT Image (OpenAI)"), ("gemini", "Nano Banana (Gemini)")]),
-            select("size", "Формат", [("1024x1536", "Вертикальный 2:3"), ("1024x1024", "Квадрат 1:1"),
-                                      ("1536x1024", "Горизонтальный 3:2")]),
+            select("engine", "Генератор", [("nb2", "Nano Banana 2 — быстро"), ("nbpro", "Nano Banana Pro — качество"),
+                                           ("flare", "GPT Image 2.5 Flare — быстро"),
+                                           ("sunburst", "GPT Image 2.5 Sunburst — качество")]),
+            select("size", "Формат и разрешение", [
+                ("1024x1536", "Вертикальный 2:3 · 1K"), ("1152x2048", "Вертикальный 9:16 · 2K"),
+                ("2160x3840", "Вертикальный 9:16 · 4K"), ("1024x1024", "Квадрат · 1K"), ("2048x2048", "Квадрат · 2K"),
+                ("1536x1024", "Горизонтальный 3:2 · 1K"), ("2048x1152", "Горизонтальный 16:9 · 2K"),
+                ("3840x2160", "Горизонтальный 16:9 · 4K")]),
+            select("quality", "Качество (для GPT Image)", [("auto", "Авто"), ("high", "Высокое"), ("max", "Максимум")]),
             select("count", "Вариантов", ["1", "2", "3", "4"]),
             check("enhance", "Улучшить промпт с помощью ИИ", True),
         ],
         run=run_image, character=True,
+        hint="Nano Banana работает по ключу Gemini, GPT Image — по ключу OpenAI. 4K и «Максимум» дороже и дольше.",
     ),
     Tool(
         "motion", "Видео-анимация", "Моушн-дизайн под каждую фразу", "sparkles", "visual",
@@ -703,6 +795,7 @@ TOOLS: list[Tool] = [
             area("script", "…или текст сценария", "Если нет видео — вставьте текст"),
             select("style", "Стиль", ["Kinetic typography", "Минимализм", "Яркий поп", "Неон / техно",
                                       "Корпоративный", "Документальный"]),
+            check("render", "Вшить анимированные субтитры в видео", True),
             select("aspect", "Формат", ASPECTS),
         ],
         system="Ты — моушн-дизайнер, который делает анимации для говорящих голов и экспертных роликов.",
@@ -715,7 +808,8 @@ TOOLS: list[Tool] = [
             "В конце — субтитры в формате SRT в блоке кода."
         ),
         run=run_motion,
-        hint="Если загрузите видео или аудио, его расшифрует Gemini.",
+        hint="Видео расшифровывается ElevenLabs Scribe v2 с точностью до слова, и в него вшиваются "
+             "анимированные субтитры в выбранном стиле. Без ключа ElevenLabs видео анализирует Gemini.",
     ),
     Tool(
         "angles", "Ракурсы камеры", "Новые ракурсы из одного дубля", "video", "visual",
@@ -730,28 +824,48 @@ TOOLS: list[Tool] = [
         hint="Полученные кадры можно анимировать в Seedance/Kling по промптам анимации.",
     ),
     Tool(
-        "video_gen", "Генерация видео", "Veo и Sora: из текста или кадра", "film", "media",
+        "video_gen", "Генерация видео", "Veo 3.1 и Gemini Omni: текст или кадр", "film", "media",
         [
-            area("prompt", "Что происходит в видео", "Действие, камера, настроение. Можно по-русски"),
+            area("prompt", "Что происходит в видео", "Действие, камера, настроение, реплики. Можно по-русски"),
             files("image", "Первый кадр", "image/*"),
-            select("engine", "Генератор", [("veo", "Veo"), ("sora", "Sora")]),
+            select("engine", "Генератор", [("veo", "Veo 3.1"), ("veo_fast", "Veo Fast"), ("omni", "Omni")]),
             select("aspect", "Формат", [("9:16", "9:16"), ("16:9", "16:9")]),
-            select("seconds", "Длительность", [("4", "4 с"), ("8", "8 с"), ("12", "12 с")], "8"),
+            select("seconds", "Длительность", [("4", "4 с"), ("6", "6 с"), ("8", "8 с")], "8"),
+            select("resolution", "Разрешение", [("720p", "720p"), ("1080p", "1080p"), ("4k", "4K")], "1080p"),
             check("enhance", "Улучшить промпт с помощью ИИ", True),
         ],
-        run=run_video_gen, character=True,
-        hint="Veo работает по ключу Gemini, Sora — по ключу OpenAI. Генерация занимает 1–5 минут и "
-             "оплачивается за секунду видео. Veo делает до 8 секунд. Готовое видео придёт и в чат.",
+        run=run_video_gen, character=True, needs=("gemini",),
+        hint="Всё работает по ключу Gemini (Sora API OpenAI закрыл в сентябре 2026). Veo 3.1 — лучшее качество "
+             "со звуком, Fast — дешевле, Omni — новая модель Google. Генерация 1–5 минут, оплата за секунду видео.",
+    ),
+    Tool(
+        "video_edit", "Редактор видео", "Замена героя, фона, стиля; продление", "wand", "media",
+        [
+            files("source", "Видео", "video/*", required=True),
+            select("mode", "Что сделать", [("edit", "Изменить"), ("extend", "Продлить")]),
+            area("instruction", "Что изменить", "Например: замени героя на девушку с фото, сделай вечер, "
+                 "добавь снег. Можно по-русски"),
+            files("refs", "Референсы (новый герой, предмет)", "image/*", multiple=True, max_files=3,
+                  show_if={"mode": ["edit"]}),
+            select("aspect", "Формат", [("9:16", "9:16"), ("16:9", "16:9")], show_if={"mode": ["extend"]}),
+            select("resolution", "Разрешение", [("720p", "720p"), ("1080p", "1080p"), ("4k", "4K")], "1080p"),
+        ],
+        run=run_video_edit, uses_llm=False, needs=("gemini",), character=True,
+        hint="Gemini Omni Flash 1.1 меняет готовое видео по описанию: героя, одежду, фон, время суток, стиль — "
+             "сохраняя движения и камеру. «Продлить» добавляет до 10 секунд продолжения.",
     ),
     Tool(
         "voices", "Голоса", "Озвучка, клон и замена голоса", "mic", "media",
         [
             select("mode", "Режим", [("tts", "Озвучить текст"), ("dub", "Дубляж видео на другой язык"),
-                                     ("sts", "Заменить голос в аудио/видео"), ("clone", "Клонировать голос")]),
+                                     ("sts", "Заменить голос в аудио/видео"), ("clone", "Клонировать голос"),
+                                     ("stt", "Расшифровать речь в текст и субтитры")]),
+            select("tts_model", "Модель", [("v4", "Eleven v4"), ("turbo", "v4 Turbo")], show_if={"mode": ["tts"]}),
             {"name": "voice", "label": "Голос", "type": "voice", "required": True,
              "show_if": {"mode": ["tts", "sts"]}},
-            area("text", "Текст", "Текст для озвучки", show_if={"mode": ["tts"]}),
-            files("source", "Аудио или видео с речью", "audio/*,video/*", show_if={"mode": ["sts", "dub"]}),
+            area("text", "Текст", "Текст для озвучки. Эмоции — тегами: [laughs] [whispers] [excited] [sighs]",
+                 show_if={"mode": ["tts"]}),
+            files("source", "Аудио или видео с речью", "audio/*,video/*", show_if={"mode": ["sts", "dub", "stt"]}),
             select("target_lang", "Язык дубляжа", DUB_LANGS, show_if={"mode": ["dub"]}),
             check("keep_video", "Вернуть видео с новым голосом", True, show_if={"mode": ["sts"]}),
             text("name", "Название голоса", "Например: Мой голос", show_if={"mode": ["clone"]}),
@@ -762,8 +876,8 @@ TOOLS: list[Tool] = [
             check("denoise", "Убрать фоновый шум", False, show_if={"mode": ["sts", "clone"]}),
         ],
         run=run_voices, uses_llm=False, needs=("elevenlabs",),
-        hint="ElevenLabs. «Дубляж» переводит видео голосами самих спикеров и сохраняет музыку и фон. "
-             "«Замена голоса» фон убирает. Клонирование доступно на платных тарифах.",
+        hint="ElevenLabs: озвучка Eleven v4 (90+ языков, включая узбекский), дубляж Dubbing v2 голосами самих "
+             "спикеров с сохранением музыки, расшифровка Scribe v2. Для клона хватит 10 секунд чистой речи.",
     ),
     Tool(
         "character", "Карточка персонажа", "Карточка из 3 фото", "user", "visual",
@@ -772,7 +886,8 @@ TOOLS: list[Tool] = [
             text("name", "Имя персонажа", "Необязательно"),
             area("notes", "Дополнительно", "Роль, характер, во что одеть"),
             check("sheet", "Нарисовать character sheet", True),
-            select("engine", "Генератор картинки", [("gemini", "Nano Banana (Gemini)"), ("openai", "GPT Image (OpenAI)")]),
+            select("engine", "Генератор картинки", [("nbpro", "Nano Banana Pro"), ("nb2", "Nano Banana 2"),
+                                                    ("sunburst", "GPT Image 2.5 Sunburst")]),
         ],
         run=run_character,
     ),

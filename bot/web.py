@@ -65,6 +65,14 @@ async def api_config(request: web.Request) -> web.Response:
             "claude": config.CLAUDE_MODEL, "openai": config.OPENAI_MODEL, "gemini": config.GEMINI_MODEL,
             "elevenlabs": config.ELEVENLABS_TTS_MODEL,
         },
+        "stack": [
+            ["Текст", f"{config.CLAUDE_MODEL} · {config.OPENAI_MODEL} · {config.GEMINI_MODEL}"],
+            ["Изображения", f"{config.GEMINI_IMAGE_MODEL} · {config.GEMINI_IMAGE_MODEL_PRO} · "
+                            f"{config.OPENAI_IMAGE_MODEL} · {config.OPENAI_IMAGE_MODEL_HQ}"],
+            ["Видео", f"{config.VEO_MODEL} · {config.VEO_FAST_MODEL} · {config.OMNI_MODEL}"],
+            ["Голос", f"{config.ELEVENLABS_TTS_MODEL} · {config.ELEVENLABS_DUBBING_MODEL} · "
+                      f"{config.ELEVENLABS_STT_MODEL} · {config.ELEVENLABS_STS_MODEL}"],
+        ],
         "tools": [t.public() for t in TOOLS],
     })
 
@@ -102,12 +110,15 @@ _tasks: set[asyncio.Task] = set()  # держим ссылки, чтобы за�
 
 def serialize(result: Result, chat_note: str, refinable: bool) -> dict:
     images = [store_media(i, "image/png") for i in result.images]
+    video_url = store_media(result.video, "video/mp4") if result.video else None
     followups = []
     for f in result.followups:
         files = {}
         for target, src in (f.get("files") or {}).items():
             if "image" in src and src["image"] < len(images):
-                files[target] = {"url": images[src["image"]]}
+                files[target] = {"url": images[src["image"]], "name": f"{target}.png"}
+            elif src.get("video") and video_url:
+                files[target] = {"url": video_url, "name": f"{target}.mp4"}
             elif "from_field" in src:
                 files[target] = src
         followups.append({**f, "files": files})
@@ -115,7 +126,7 @@ def serialize(result: Result, chat_note: str, refinable: bool) -> dict:
         "text": result.text,
         "images": images,
         "audio": store_media(result.audio, "audio/mpeg") if result.audio else None,
-        "video": store_media(result.video, "video/mp4") if result.video else None,
+        "video": video_url,
         "chat_note": chat_note,
         "followups": followups,
         "character": result.character,

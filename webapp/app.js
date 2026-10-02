@@ -73,7 +73,7 @@ const THEMES = [
 ];
 const STATUS_TEXT = ["Отправляю запрос…", "Модель анализирует задачу…", "Пишу результат…", "Ещё немного…", "Почти готово…"];
 const STATUS_LONG = ["Загружаю файлы…", "Задача в очереди…", "Генерирую — это занимает 1–5 минут…", "Всё ещё работаю, можно свернуть приложение…", "Почти готово…"];
-const LONG_TOOLS = ["video_gen", "voices"];
+const LONG_TOOLS = ["video_gen", "video_edit", "voices", "motion"];
 const REFINE_CHIPS = ["Короче", "Подробнее", "Больше вариантов", "Смелее и ярче", "Проще язык"];
 
 // ================= Состояние =================
@@ -825,7 +825,8 @@ async function submit() {
     ch.photos.slice(0, 3).forEach((b, i) => fd.append("_character_photos", b, `character${i}.jpg`));
   }
 
-  const long = LONG_TOOLS.includes(tool.id) && (tool.id !== "voices" || S.values.mode === "dub");
+  const long = LONG_TOOLS.includes(tool.id) && (tool.id !== "voices" || S.values.mode === "dub")
+    && (tool.id !== "motion" || (S.files.media || []).length > 0);
   const started = Date.now();
   S.busy = true;
   box.innerHTML = skeletonHTML(long);
@@ -873,7 +874,7 @@ function resultHTML(res, { meta = "", rerun = false, job = "" } = {}) {
   const nextSteps = follow.length || res.character ? `<div class="next">
       <div class="next-title">Дальше</div>
       ${res.character ? `<button class="next-btn" data-save-char>${icon("bookmark")}<span>Сохранить персонажа в библиотеку</span>${icon("arrow", "sm")}</button>` : ""}
-      ${follow.map((f, i) => `<button class="next-btn" data-follow="${i}">${icon(f.tool === "video_gen" ? "play" : "mic")}<span>${esc(f.label)}</span>${icon("arrow", "sm")}</button>`).join("")}
+      ${follow.map((f, i) => `<button class="next-btn" data-follow="${i}">${icon({ video_gen: "play", video_edit: "wand", voices: "mic" }[f.tool] || "arrow")}<span>${esc(f.label)}</span>${icon("arrow", "sm")}</button>`).join("")}
     </div>` : "";
 
   const refineBox = res.refinable && job ? `<div class="refine">
@@ -900,7 +901,7 @@ async function followup(f) {
   const files = {};
   try {
     for (const [field, src] of Object.entries(f.files || {})) {
-      if (src.url) files[field] = [await urlToFile(src.url, `${field}.png`)];
+      if (src.url) files[field] = [await urlToFile(src.url, src.name || `${field}.png`)];
       else if (src.from_field && S.files[src.from_field]) files[field] = S.files[src.from_field].slice();
     }
   } catch {
@@ -1170,6 +1171,9 @@ function renderSettings() {
       <div class="list-row"><span class="dot ${p[k] ? "" : "off"}"></span>
         <div class="body"><b>${SERVICE_NAMES[k]}</b><small>${p[k] ? esc(models[k] || "Подключено") : "Ключ не задан"}</small></div></div>`).join("")}
     </div>
+
+    ${(S.cfg.stack || []).length ? `<div class="group-label">Модели</div><div class="list">${S.cfg.stack.map(([k, v]) =>
+      `<div class="list-row"><div class="body"><b>${esc(k)}</b><small style="white-space:normal">${esc(v)}</small></div></div>`).join("")}</div>` : ""}
 
     <div class="group-label">Данные</div>
     <div class="list"><button class="list-row danger" id="clear">${icon("trash", "sm")}Очистить историю</button></div>

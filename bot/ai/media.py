@@ -60,13 +60,50 @@ async def extract_frame(video: Media, at: float = 0.3) -> Media:
             return Media(f.read(), "image/jpeg", "frame.jpg")
 
 
-async def fit_image(image: Media, width: int, height: int) -> Media:
-    """Обрезает и масштабирует картинку точно под размер кадра (нужно для Sora)."""
+async def probe_size(video: Media) -> tuple[int, int]:
+    """Ширина и высота видео (с учётом поворота с телефона)."""
     with tempfile.TemporaryDirectory() as tmp:
-        src, dst = os.path.join(tmp, "in"), os.path.join(tmp, "fit.jpg")
+        src = os.path.join(tmp, "in")
         with open(src, "wb") as f:
-            f.write(image.data)
-        vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
-        await _ffmpeg("-i", src, "-vf", vf, "-q:v", "2", dst)
+            f.write(video.data)
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:stream_side_data=rotation", "-of", "json", src,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+    import json
+
+    try:
+        stream = json.loads(out)["streams"][0]
+        w, h = int(stream["width"]), int(stream["height"])
+        rotation = next((abs(int(d.get("rotation", 0))) for d in stream.get("side_data_list", [])), 0)
+        return (h, w) if rotation in (90, 270) else (w, h)
+    except (KeyError, IndexError, ValueError):
+        return 1080, 1920
+
+
+async def to_mp3(audio: bytes) -> bytes:
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = os.path.join(tmp, "in"), os.path.join(tmp, "out.mp3")
+        with open(src, "wb") as f:
+            f.write(audio)
+        await _ffmpeg("-i", src, "-b:a", "192k", dst)
         with open(dst, "rb") as f:
-            return Media(f.read(), "image/jpeg", "frame.jpg")
+            return f.read()
+
+
+async def burn_subtitles(video: Media, ass: str) -> bytes:
+    """Вшивает субтитры ASS (с анимацией) в видео."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src, subs, out = (os.path.join(tmp, n) for n in ("in", "subs.ass", "out.mp4"))
+        with open(src, "wb") as f:
+            f.write(video.data)
+        with open(subs, "w", encoding="utf-8") as f:
+            f.write(ass)
+        await _ffmpeg(
+            "-i", src, "-vf", f"ass={subs}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out,
+        )
+        with open(out, "rb") as f:
+            return f.read()

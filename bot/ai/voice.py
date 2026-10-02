@@ -1,4 +1,4 @@
-"""ElevenLabs: озвучка текста, клонирование голоса и замена голоса (speech-to-speech)."""
+"""ElevenLabs: озвучка (Eleven v4), клон, замена голоса, дубляж (Dubbing v2) и расшифровка (Scribe v2)."""
 
 import asyncio
 
@@ -37,10 +37,16 @@ async def list_voices() -> list[dict]:
     return voices
 
 
-async def text_to_speech(voice_id: str, text: str) -> bytes:
-    url = f"{API}/text-to-speech/{voice_id}?output_format=mp3_44100_128"
+async def text_to_speech(voice_id: str, text: str, fast: bool = False) -> bytes:
+    """Eleven v4 понимает теги эмоций прямо в тексте: [laughs], [whispers], [excited] и т.п."""
+    url = f"{API}/text-to-speech/{voice_id}?output_format=mp3_44100_192"
+    body = {
+        "text": text,
+        "model_id": config.ELEVENLABS_TTS_FAST_MODEL if fast else config.ELEVENLABS_TTS_MODEL,
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }
     async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
-        async with s.post(url, headers=_headers(), json={"text": text, "model_id": config.ELEVENLABS_TTS_MODEL}) as r:
+        async with s.post(url, headers=_headers(), json=body) as r:
             await _check(r)
             return await r.read()
 
@@ -70,45 +76,71 @@ async def speech_to_speech(voice_id: str, audio: Media, remove_noise: bool) -> b
             return await r.read()
 
 
-# --- Дубляж: перевод видео/аудио на другой язык голосами исходных спикеров с сохранением фона ---
+# --- Дубляж (Dubbing v2): перевод голосами самих спикеров, фон и музыка сохраняются ---
 
 DUB_POLL_SECONDS = 10
-DUB_MAX_WAIT = 30 * 60
+DUB_MAX_WAIT = 40 * 60
 
 
-async def dub(media: Media, target_lang: str, source_lang: str = "auto", num_speakers: int = 0) -> tuple[bytes, str]:
-    """Возвращает (файл, mime). Для видео ElevenLabs отдаёт mp4, для аудио — mp3."""
+async def dub(media: Media, target_lang: str) -> bytes:
+    """Возвращает дублированную дорожку (FLAC без потерь) — её вставляют обратно в видео."""
     form = aiohttp.FormData()
     ext = "mp4" if media.is_video else "mp3"
     form.add_field("file", media.data, filename=f"source.{ext}", content_type=media.mime)
-    form.add_field("target_lang", target_lang)
-    form.add_field("source_lang", source_lang)
-    form.add_field("num_speakers", str(num_speakers))
-    form.add_field("watermark", "false")
-    form.add_field("drop_background_audio", "false")
-    form.add_field("name", f"myaihelper-{target_lang}")
+    form.add_field("model_id", config.ELEVENLABS_DUBBING_MODEL)
+    form.add_field("reference", "myaihelper")
     async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
-        async with s.post(f"{API}/dubbing", headers=_headers(), data=form) as r:
+        async with s.post(f"{API}/dubbing/project", headers=_headers(), data=form) as r:
             await _check(r)
-            dubbing_id = (await r.json())["dubbing_id"]
+            project_id = (await r.json())["project_id"]
+        # Язык можно добавить сразу: задача начнётся, когда исходник будет расшифрован
+        async with s.post(f"{API}/dubbing/project/{project_id}/language", headers=_headers(),
+                          json={"target_language": target_lang}) as r:
+            await _check(r)
+            language_id = (await r.json())["language_id"]
 
         waited = 0
         while True:
             await asyncio.sleep(DUB_POLL_SECONDS)
             waited += DUB_POLL_SECONDS
-            async with s.get(f"{API}/dubbing/{dubbing_id}", headers=_headers()) as r:
+            async with s.get(f"{API}/dubbing/project/{project_id}/language/{language_id}", headers=_headers()) as r:
                 await _check(r)
                 info = await r.json()
             status = info.get("status")
-            if status == "dubbed":
+            if status == "completed":
+                url = (info.get("outputs") or {}).get("lossless_audio")
+                if not url:
+                    raise AIError("ElevenLabs: дубляж готов, но ссылка на файл не пришла.")
                 break
-            if status == "failed":
-                raise AIError(f"ElevenLabs: дубляж не удался. {info.get('error', '')}".strip())
+            if status in ("failed", "cancelled"):
+                raise AIError(f"ElevenLabs: дубляж не удался. {info.get('error') or info.get('warnings') or ''}".strip())
+            if waited % 60 == 0:  # проверяем, не упал ли сам проект (например, не удалось расшифровать)
+                async with s.get(f"{API}/dubbing/project/{project_id}", headers=_headers()) as r:
+                    if r.status < 400 and (await r.json()).get("status") == "failed":
+                        raise AIError("ElevenLabs: не удалось обработать исходный файл.")
             if waited >= DUB_MAX_WAIT:
                 raise AIError("ElevenLabs: дубляж идёт слишком долго. Попробуйте ролик короче.")
 
-        async with s.get(f"{API}/dubbing/{dubbing_id}/audio/{target_lang}", headers=_headers()) as r:
+        async with s.get(url) as r:  # подписанная ссылка, ключ не нужен
             await _check(r)
-            data = await r.read()
-            mime = r.headers.get("Content-Type", "video/mp4" if media.is_video else "audio/mpeg").split(";")[0]
-    return data, mime
+            return await r.read()
+
+
+# --- Расшифровка речи (Scribe v2): текст с точными таймкодами каждого слова ---
+
+
+async def transcribe(media: Media, language: str = "") -> dict:
+    """Возвращает {"language_code", "text", "words": [{"text", "start", "end", "type", "speaker_id"}]}."""
+    audio = await to_audio(media)
+    form = aiohttp.FormData()
+    form.add_field("file", audio.data, filename="audio.mp3", content_type=audio.mime)
+    form.add_field("model_id", config.ELEVENLABS_STT_MODEL)
+    form.add_field("timestamps_granularity", "word")
+    form.add_field("diarize", "true")
+    form.add_field("tag_audio_events", "false")
+    if language:
+        form.add_field("language_code", language)
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
+        async with s.post(f"{API}/speech-to-text", headers=_headers(), data=form) as r:
+            await _check(r)
+            return await r.json()

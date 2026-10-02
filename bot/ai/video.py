@@ -1,67 +1,48 @@
-"""Генерация видео: Veo (Google, ключ Gemini) и Sora (OpenAI)."""
+"""Видео: Veo 3.1 и Gemini Omni Flash 1.1 (Google, ключ Gemini).
+
+Sora API OpenAI отключил 24.09.2026, поэтому видео делается только через Google.
+"""
 
 import asyncio
+import base64
+import io
 import logging
-import re
 
 from .. import config
-from .llm import AIError, Media, gemini_client, openai_client, require
-from .media import fit_image
+from .llm import GEMINI_INLINE_LIMIT, GEMINI_MIME_FIX, AIError, Media, gemini_client, require
 
 log = logging.getLogger(__name__)
 
 POLL_SECONDS = 10
 MAX_WAIT = 20 * 60
-VEO_FALLBACK = "veo-3.1-fast-generate-preview"
-_veo_model: str | None = None
 
 
-async def veo_model() -> str:
-    """Модель из VEO_MODEL или самая свежая доступная (предпочтительно fast — она дешевле)."""
-    global _veo_model
-    if config.VEO_MODEL:
-        return config.VEO_MODEL
-    if _veo_model:
-        return _veo_model
-    try:
-        names = []
-        async for m in await gemini_client().aio.models.list():
-            name = (m.name or "").split("/")[-1]
-            if name.startswith("veo-"):
-                names.append(name)
+def _image(m: Media):
+    from google.genai import types
 
-        def version(n: str) -> float:
-            found = re.search(r"veo-(\d+(?:\.\d+)?)", n)
-            return float(found.group(1)) if found else 0.0
-
-        pool = [n for n in names if "fast" in n] or names
-        pool.sort(key=lambda n: (version(n), "preview" not in n), reverse=True)
-        _veo_model = pool[0] if pool else VEO_FALLBACK
-    except Exception as e:  # список моделей недоступен — берём известную
-        log.warning("cannot list Veo models: %s", e)
-        _veo_model = VEO_FALLBACK
-    log.info("Veo model: %s", _veo_model)
-    return _veo_model
+    return types.Image(image_bytes=m.data, mime_type=m.mime)
 
 
-async def veo(prompt: str, image: Media | None, refs: list[Media], aspect: str, seconds: int) -> bytes:
+async def veo(prompt: str, image: Media | None, refs: list[Media], aspect: str, seconds: int,
+              resolution: str, fast: bool) -> bytes:
+    """Veo 3.1: текст/кадр → видео со звуком. Референсы (до 3) — персонаж/предметы, только 8 секунд."""
     require("gemini")
     from google.genai import types
 
     client = gemini_client()
-    cfg = types.GenerateVideosConfig(aspect_ratio=aspect, duration_seconds=min(seconds, 8), number_of_videos=1)
+    seconds = 8 if refs and not image else min(max(seconds, 4), 8)
+    if seconds not in (4, 6, 8):
+        seconds = 8
+    cfg = types.GenerateVideosConfig(
+        aspect_ratio=aspect, duration_seconds=seconds, resolution=resolution, number_of_videos=1,
+    )
     if refs and not image:
         cfg.reference_images = [
-            types.VideoGenerationReferenceImage(
-                image=types.Image(image_bytes=m.data, mime_type=m.mime), reference_type="asset"
-            )
-            for m in refs[:3]
+            types.VideoGenerationReferenceImage(image=_image(m), reference_type="asset") for m in refs[:3]
         ]
     op = await client.aio.models.generate_videos(
-        model=await veo_model(),
-        prompt=prompt,
-        image=types.Image(image_bytes=image.data, mime_type=image.mime) if image else None,
-        config=cfg,
+        model=config.VEO_FAST_MODEL if fast else config.VEO_MODEL,
+        prompt=prompt, image=_image(image) if image else None, config=cfg,
     )
     waited = 0
     while not op.done:
@@ -86,35 +67,73 @@ async def veo(prompt: str, image: Media | None, refs: list[Media], aspect: str, 
     return data
 
 
-SORA_SIZES = {"9:16": (720, 1280), "16:9": (1280, 720)}
+async def _omni_media(m: Media) -> dict:
+    """Контент для Omni: маленькие файлы — внутри запроса, большие видео — через Files API."""
+    mime = GEMINI_MIME_FIX.get(m.mime, m.mime)
+    kind = "video" if m.is_video else "image"
+    if len(m.data) <= GEMINI_INLINE_LIMIT:
+        return {"type": kind, "data": base64.b64encode(m.data).decode(), "mime_type": mime}
+    from google.genai import types
+
+    client = gemini_client()
+    uploaded = await client.aio.files.upload(file=io.BytesIO(m.data), config=types.UploadFileConfig(mime_type=mime))
+    for _ in range(120):
+        if uploaded.state and uploaded.state.name != "PROCESSING":
+            break
+        await asyncio.sleep(2)
+        uploaded = await client.aio.files.get(name=uploaded.name)
+    return {"type": kind, "uri": uploaded.uri, "mime_type": mime}
 
 
-async def sora(prompt: str, image: Media | None, aspect: str, seconds: int) -> bytes:
-    require("openai")
-    client = openai_client()
-    w, h = SORA_SIZES.get(aspect, SORA_SIZES["9:16"])
-    secs = "12" if seconds >= 12 else "8" if seconds >= 6 else "4"
-    kwargs = {}
-    if image:
-        frame = await fit_image(image, w, h)
-        kwargs["input_reference"] = ("frame.jpg", frame.data, "image/jpeg")
-    job = await client.videos.create(model=config.SORA_MODEL, prompt=prompt, seconds=secs, size=f"{w}x{h}", **kwargs)
+async def omni(prompt: str, task: str, media: list[Media], aspect: str, resolution: str) -> bytes:
+    """Gemini Omni Flash 1.1. task: text_to_video | image_to_video | reference_to_video | edit | extend."""
+    require("gemini")
+    client = gemini_client()
+    content = [await _omni_media(m) for m in media]
+    content.append({"type": "text", "text": prompt})
+    response_format = {"type": "video", "resolution": resolution}
+    if task != "edit":  # при редактировании пропорции берутся из исходного видео
+        response_format["aspect_ratio"] = aspect
+    interaction = await client.aio.interactions.create(
+        model=config.OMNI_MODEL,
+        input=content,
+        response_format=response_format,
+        generation_config={"video_config": {"task": task}},
+        background=True,
+    )
     waited = 0
-    while job.status in ("queued", "in_progress"):
+    while interaction.status in ("queued", "in_progress"):
         if waited >= MAX_WAIT:
-            raise AIError("Sora генерирует слишком долго. Попробуйте позже.")
+            raise AIError("Gemini Omni генерирует слишком долго. Попробуйте позже.")
         await asyncio.sleep(POLL_SECONDS)
         waited += POLL_SECONDS
-        job = await client.videos.retrieve(job.id)
-    if job.status != "completed":
-        message = getattr(job.error, "message", None) or "видео не создано"
-        raise AIError(f"Sora: {message}")
-    content = await client.videos.download_content(job.id)
-    return content.content
+        interaction = await client.aio.interactions.get(interaction.id)
+    if interaction.status != "completed":
+        error = getattr(interaction, "error", None)
+        raise AIError(f"Gemini Omni: {getattr(error, 'message', None) or interaction.status}")
+    out = interaction.output_video
+    if out and out.data:
+        return base64.b64decode(out.data)
+    if out and out.uri:
+        data = await client.aio.files.download(file=out.uri)
+        if data:
+            return data
+    raise AIError("Gemini Omni не вернул видео — вероятно, сработал фильтр безопасности.")
 
 
 async def generate_video(engine: str, prompt: str, image: Media | None = None, refs: list[Media] | None = None,
-                         aspect: str = "9:16", seconds: int = 8) -> bytes:
-    if engine == "sora":
-        return await sora(prompt, image or (refs[0] if refs else None), aspect, seconds)
-    return await veo(prompt, image, refs or [], aspect, seconds)
+                         aspect: str = "9:16", seconds: int = 8, resolution: str = "1080p") -> bytes:
+    refs = refs or []
+    if engine == "omni":
+        if image:
+            return await omni(prompt, "image_to_video", [image], aspect, resolution)
+        if refs:
+            return await omni(prompt, "reference_to_video", refs[:3], aspect, resolution)
+        return await omni(prompt, "text_to_video", [], aspect, resolution)
+    return await veo(prompt, image, refs, aspect, seconds, resolution, fast=engine == "veo_fast")
+
+
+async def edit_video(source: Media, instruction: str, refs: list[Media], task: str = "edit",
+                     resolution: str = "1080p", aspect: str = "9:16") -> bytes:
+    """Редактирование (замена персонажа, фона, стиля) или продление существующего видео через Omni."""
+    return await omni(instruction, task, [source, *refs[:3]], aspect, resolution)

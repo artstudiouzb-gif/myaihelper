@@ -14,7 +14,7 @@ PROVIDER_NAMES = {"claude": "Claude", "openai": "ChatGPT", "gemini": "Gemini", "
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 # Файлы больше этого размера отправляются в Gemini через Files API, а не внутри запроса
 GEMINI_INLINE_LIMIT = 15 * 1024 * 1024
-MAX_TOKENS = 8000
+MAX_TOKENS = 32000
 # Gemini ждёт немного другие MIME-типы, чем отдают браузеры
 GEMINI_MIME_FIX = {"video/quicktime": "video/mov", "audio/mpeg": "audio/mp3", "audio/x-wav": "audio/wav",
                    "audio/x-m4a": "audio/aac", "audio/mp4": "audio/aac"}
@@ -102,13 +102,24 @@ async def _claude_text(system: str, prompt: str, media: list[Media]) -> str:
         for m in media
     ]
     content.append({"type": "text", "text": prompt})
-    resp = await _claude().messages.create(
+    # Стриминг — чтобы длинные ответы не упирались в таймаут HTTP.
+    # fallbacks="default": если модель откажет по правилам безопасности, запрос сам продолжится на запасной модели.
+    async with _claude().beta.messages.stream(
         model=config.CLAUDE_MODEL,
         max_tokens=MAX_TOKENS,
         system=system,
         messages=[{"role": "user", "content": content}],
-    )
-    return "".join(block.text for block in resp.content if block.type == "text").strip()
+        output_config={"effort": config.CLAUDE_EFFORT},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+    ) as stream:
+        message = await stream.get_final_message()
+    if message.stop_reason == "refusal":
+        raise AIError("Claude отказался выполнять запрос. Переформулируйте его или выберите другую модель.")
+    text = "".join(block.text for block in message.content if block.type == "text").strip()
+    if message.stop_reason == "max_tokens":
+        text += "\n\n⚠️ Ответ обрезан по длине — попросите «продолжи» через «Доработать»."
+    return text
 
 
 async def _openai_text(system: str, prompt: str, media: list[Media]) -> str:
@@ -119,6 +130,7 @@ async def _openai_text(system: str, prompt: str, media: list[Media]) -> str:
     resp = await openai_client().chat.completions.create(
         model=config.OPENAI_MODEL,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
+        reasoning_effort=config.OPENAI_REASONING,
     )
     return (resp.choices[0].message.content or "").strip()
 

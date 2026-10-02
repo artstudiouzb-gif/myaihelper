@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
-# ffmpeg нужен, чтобы извлекать звук из видео и вставлять новый голос обратно
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+# ffmpeg — звук, кадры, дубляж и вшивание субтитров; шрифты с кириллицей — для анимированных субтитров
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-montserrat fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
