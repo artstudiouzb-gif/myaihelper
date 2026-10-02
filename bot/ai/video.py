@@ -8,7 +8,7 @@ import base64
 import io
 import logging
 
-from .. import config
+from .. import config, prompt_rules
 from .llm import GEMINI_INLINE_LIMIT, GEMINI_MIME_FIX, AIError, Media, gemini_client, require
 
 log = logging.getLogger(__name__)
@@ -124,6 +124,7 @@ async def omni(prompt: str, task: str, media: list[Media], aspect: str, resoluti
 async def generate_video(engine: str, prompt: str, image: Media | None = None, refs: list[Media] | None = None,
                          aspect: str = "9:16", seconds: int = 8, resolution: str = "1080p") -> bytes:
     refs = refs or []
+    prompt = prompt_rules.sanitize(prompt)  # HEX и разметка иначе попадают в кадр
     if engine == "omni":
         if image:
             return await omni(prompt, "image_to_video", [image], aspect, resolution)
@@ -136,4 +137,4 @@ async def generate_video(engine: str, prompt: str, image: Media | None = None, r
 async def edit_video(source: Media, instruction: str, refs: list[Media], task: str = "edit",
                      resolution: str = "1080p", aspect: str = "9:16") -> bytes:
     """Редактирование (замена персонажа, фона, стиля) или продление существующего видео через Omni."""
-    return await omni(instruction, task, [source, *refs[:3]], aspect, resolution)
+    return await omni(prompt_rules.sanitize(instruction), task, [source, *refs[:3]], aspect, resolution)

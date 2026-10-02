@@ -136,7 +136,8 @@ def lang_rule(lang: str, prompts_in_english: bool = True) -> str:
             " Промпты для нейросетей-генераторов (то, что пользователь будет копировать в генератор) "
             "пиши на английском, каждый — в отдельном блоке кода с пометкой ```prompt. Вспомогательные "
             "английские блоки (character bible, style bible, negative prompt) помечай ```text. "
-            "Реплики героев — в кавычках на языке, который укажет пользователь (а если не указал — на языке ответа)."
+            "Реплики героев — в кавычках на языке, который укажет пользователь (а если не указал — на языке ответа).\n"
+            + prompt_rules.HYGIENE_RULE
         )
     return rule
 
@@ -205,7 +206,7 @@ async def enforce_format(ctx: RunContext, system: str, answer: str, generator: s
     """Проверяет промпты в ответе по правилам генератора; при нарушениях один раз просит модель исправить."""
     issues = prompt_rules.check_answer(answer, generator, seconds, refs)
     if not issues:
-        return answer
+        return prompt_rules.sanitize_answer(answer)
     log.info("prompt format issues (%s): %s", generator, issues)
     fixed = await llm.generate_text(
         ctx.refine["provider"] if ctx.refine else ctx.provider, system,
@@ -214,6 +215,7 @@ async def enforce_format(ctx: RunContext, system: str, answer: str, generator: s
         + "\n\nИсправь ВСЕ нарушения и верни ПОЛНЫЙ исправленный ответ целиком, в том же оформлении, "
         "без комментариев об исправлениях.\n\n## Ответ\n" + answer,
     )
+    fixed = prompt_rules.sanitize_answer(fixed)  # коды цветов и разметку убираем в любом случае
     left = prompt_rules.check_answer(fixed, generator, seconds, refs)
     if left:
         fixed += "\n\n⚠️ Автопроверка формата: " + "; ".join(left)
@@ -227,9 +229,8 @@ async def run_text(tool: Tool, ctx: RunContext) -> Result:
     rules = f"\n\n{prompt_rules.rules_for(generator, seconds)}" if generator else ""
     system = f"{PRODUCER}\n\n{tool.system}{rules}\n\n{lang_rule(ctx.lang)}".strip()
     answer = await ask(ctx, system, build_prompt(tool, ctx, attachments_note=note), media)
-    if generator:
-        refs = len([m for m in media if m.is_image])
-        answer = await enforce_format(ctx, system, answer, generator, seconds, refs)
+    refs = len([m for m in media if m.is_image])
+    answer = await enforce_format(ctx, system, answer, generator, seconds, refs)
     return Result(text=answer)
 
 
@@ -342,8 +343,7 @@ async def run_video_study(tool: Tool, ctx: RunContext) -> Result:
               f"Промпты сцен — не длиннее {seconds} с каждая.\n\n{rules}\n\n{lang_rule(ctx.lang)}")
     note = "Первый файл — видео. Изображения (если есть) — фото нового персонажа."
     answer = await ask(ctx, system, build_prompt(tool, ctx, task, note), all_media(tool, ctx), provider="gemini")
-    if rules:
-        answer = await enforce_format(ctx, system, answer, generator, seconds, 0)
+    answer = await enforce_format(ctx, system, answer, generator if rules else "", seconds, 0)
 
     anim = ""
     found = re.search(rf"{ANIM_MARK}\s*(.+)", answer)
@@ -414,9 +414,13 @@ async def run_image(tool: Tool, ctx: RunContext) -> Result:
             "Ты — эксперт по промптам для генерации изображений. Перепиши запрос пользователя в один промпт "
             f"на английском.\n{guide}\n"
             + (f"Референсов приложено: {len(refs)} — назови роль каждого (Image 1, Image 2…).\n" if refs else "")
+            + "Если это постер/открытка/обложка со свободным местом под текст или логотип — опиши это место как "
+              "пустой фон самой сцены (например, «the upper part is plain soft cream background»), без рамок, "
+              "размеров и процентов. Надписи — только те, что дал пользователь, дословно в кавычках.\n"
+            + prompt_rules.HYGIENE_RULE + "\n"
             + "Верни ТОЛЬКО сам промпт, без пояснений и кавычек вокруг него."
         )
-        prompt = await llm.generate_text(ctx.provider, system, prompt, refs)
+        prompt = prompt_rules.sanitize(await llm.generate_text(ctx.provider, system, prompt, refs))
         note = f"**Улучшенный промпт:**\n```prompt\n{prompt}\n```"
     tasks = [images.generate_image(engine, prompt, refs, ctx.v("size", "1024x1536"), ctx.v("quality", "auto"))
              for _ in range(int(ctx.v("count", "1")))]
@@ -451,7 +455,8 @@ async def run_motion(tool: Tool, ctx: RunContext) -> Result:
         tool, ctx,
         "Сделай план моушн-дизайна по готовой расшифровке с точными таймкодами (секунды). Для каждой фразы: "
         "таймкод, ключевое слово-акцент, анимация (kinetic type, pop-up иконка, счётчик, подчёркивание, стрелки, "
-        "B-roll), элементы на экране, переход, звук (SFX). Затем: общий стиль (шрифты, палитра в HEX, скорость), "
+        "B-roll), элементы на экране, переход, звук (SFX). Затем: общий стиль для монтажёра (шрифты, палитра в HEX, "
+        "отступы, скорость — только в описательной части), "
         "как собрать в CapCut и After Effects, промпты для AI-генерации анимированных вставок.",
         f"Расшифровка (язык: {transcript.get('language_code', '?')}):\n{subtitles.timeline(phrases)}",
     )
@@ -484,7 +489,7 @@ async def run_angles(tool: Tool, ctx: RunContext) -> Result:
         'frame: the new camera position, shot size, lens and what must stay identical", "video_prompt": '
         '"English Veo 3.1 image-to-video prompt: only camera and subject motion over 8 seconds plus one '
         'SFX: line and one Ambient noise: line; do not re-describe the frame"}]}\n'
-        f"Поля scene, name и why пиши на {lang} языке."
+        f"Поля scene, name и why пиши на {lang} языке.\n" + prompt_rules.HYGIENE_RULE
     )
     data = extract_json(await llm.generate_text(ctx.provider, system, prompt, frame))
     angles = data.get("angles", [])[:count]
@@ -610,9 +615,9 @@ async def run_character(tool: Tool, ctx: RunContext) -> Result:
     results = await asyncio.gather(*jobs, return_exceptions=True)
     if isinstance(results[0], BaseException):
         raise results[0]
-    result = Result(text=results[0])
+    result = Result(text=prompt_rules.sanitize_answer(results[0]))
     ctx.refine = {"system": system, "prompt": prompt, "provider": ctx.provider}
-    found = re.search(r"Промпт персонажа[^\n]*\n+(?:[^`]*?)```[^\n]*\n(.*?)```", results[0], re.S)
+    found = re.search(r"Промпт персонажа[^\n]*\n+(?:[^`]*?)```[^\n]*\n(.*?)```", result.text, re.S)
     result.character = {"name": ctx.v("name"), "prompt": found.group(1).strip() if found else ""}
     if len(results) > 1:
         if isinstance(results[1], BaseException):
@@ -626,7 +631,7 @@ async def run_character(tool: Tool, ctx: RunContext) -> Result:
 VIDEO_ENHANCE = (
     "Ты — режиссёр AI-видео. Перепиши запрос пользователя в один готовый промпт для {engine}, "
     "формат {aspect}.\n{rules}\n"
-    "Реплики героев оставь на языке пользователя, в кавычках. "
+    "Реплики героев оставь на языке пользователя, в кавычках.\n{hygiene}\n"
     "Верни ТОЛЬКО сам промпт, без пояснений и без блоков кода."
 )
 
@@ -650,7 +655,8 @@ async def run_video_gen(tool: Tool, ctx: RunContext) -> Result:
         generator = "omni" if engine == "omni" else "veo"
         seconds = prompt_rules.clamp_seconds(generator, seconds)
         system = VIDEO_ENHANCE.format(engine=ENGINE_NAMES.get(engine, "Veo"), aspect=aspect,
-                                      rules=prompt_rules.rules_for(generator, seconds))
+                                      rules=prompt_rules.rules_for(generator, seconds),
+                                      hygiene=prompt_rules.HYGIENE_RULE)
         refs = ([image] if image else []) + ctx.character_media[:2]
         prompt = (await llm.generate_text(ctx.provider, system, prompt, refs)).strip().strip("`")
         issues = prompt_rules.check_prompt(prompt, generator, seconds)
@@ -659,6 +665,7 @@ async def run_video_gen(tool: Tool, ctx: RunContext) -> Result:
                 ctx.provider, system,
                 "Исправь промпт, нарушения: " + "; ".join(issues) + ". Верни только исправленный промпт.\n\n" + prompt,
             )).strip().strip("`")
+    prompt = prompt_rules.sanitize(prompt)
     clip = await video.generate_video(engine, prompt, image, ctx.character_media, aspect, seconds, resolution)
     result = Result(text=f"**{ENGINE_NAMES.get(engine, engine)} · {resolution}**\n\n**Промпт:**\n```prompt\n{prompt}\n```", video=clip)
     result.followups.append({"label": "Продлить это видео (Omni)", "tool": "video_edit",
@@ -672,7 +679,8 @@ OMNI_EDIT_GUIDE = {
         "Гайд: правка — это «дельта», а не описание сцены. 2–3 предложения: глагол изменения (Replace / Change / "
         "Add / Remove / Restyle), уточнение, и обязательная фраза-фиксатор: что сохранить (движения, тайминг, "
         "камера, фон, голос) и «Keep everything else identical.». Если приложены референсы — сошлись на них как "
-        "«the person/object in the reference image». Верни только промпт."
+        "«the person/object in the reference image». Цвета — словами, без HEX, процентов и отступов. "
+        "Верни только промпт."
     ),
     "extend": (
         "Перепиши просьбу в промпт продления видео для Gemini Omni Flash (на английском): что происходит дальше "
@@ -834,7 +842,8 @@ TOOLS: list[Tool] = [
         system="Ты отвечаешь за непрерывность (continuity) AI-сериала: персонажи и мир не должны «плыть».",
         task=(
             "Разбей историю на {scenes} связанных сцен по {scene_len} с (не больше лимита выбранного генератора).\n"
-            "Начни с блоков **Character bible** и **Style bible** (на английском, в ```text).\n"
+            "Начни с блоков **Character bible** и **Style bible** (на английском, в ```text; цвета — словами, "
+            "без HEX-кодов и технических параметров, потому что эти блоки копируются в каждый промпт).\n"
             "Для каждой сцены: описание, промпт ```prompt (дословно повторяй блок персонажа и стиля в "
             "каждом промпте), **последний кадр** — его можно использовать как стартовый кадр следующей "
             "сцены, и реплика/закадровый текст. Каждая сцена продолжает предыдущую без скачков."
@@ -895,7 +904,8 @@ TOOLS: list[Tool] = [
             "Сделай план моушн-дизайна. Если приложено видео или аудио — расшифруй речь и разбей на фразы "
             "с точными таймкодами. Для каждой фразы: таймкод, текст, ключевое слово-акцент, анимация "
             "(kinetic type, pop-up иконка, счётчик, подчёркивание, стрелки, B-roll и т.д.), элементы на экране, "
-            "переход, звук (SFX).\nЗатем: общий стиль (шрифты, палитра в HEX, скорость анимаций), как собрать в "
+            "переход, звук (SFX).\nЗатем: общий стиль для монтажёра (шрифты, палитра в HEX, отступы, скорость анимаций "
+            "— только в описательной части, не в промптах), как собрать в "
             "CapCut и в After Effects, промпты для AI-генерации анимированных вставок. "
             "В конце — субтитры в формате SRT в блоке кода."
         ),

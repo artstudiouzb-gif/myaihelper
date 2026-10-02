@@ -2,7 +2,7 @@
 
 import base64
 
-from .. import config
+from .. import config, prompt_rules
 from .llm import AIError, Media, gemini_client, openai_client, require
 
 # Движок → (провайдер, модель)
@@ -65,6 +65,7 @@ async def generate_image(engine: str, prompt: str, refs: list[Media] | None = No
                          size: str = "1024x1024", quality: str = "auto") -> list[bytes]:
     engine = ALIASES.get(engine, engine)
     provider, model = ENGINES.get(engine, ENGINES["nb2"])
+    prompt = prompt_rules.sanitize(prompt)  # HEX и разметка иначе рисуются как надписи
     if provider == "gemini":
         return await gemini_image(model(), prompt, refs or [], size)
     return await openai_image(model(), prompt, refs or [], size, quality)
